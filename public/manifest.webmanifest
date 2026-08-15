@@ -1,0 +1,12 @@
+{
+  "name": "拾词",
+  "short_name": "拾词",
+  "description": "捕捉并理解散落在任何场景里的语言片段",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f8",
+  "theme_color": "#0d766e",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

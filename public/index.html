@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0d766e" />
+    <meta name="description" content="拾词：捕捉并理解散落在任何场景里的语言片段。" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css?v=8" />
+    <title>拾词</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <main class="workspace">
+        <header class="topbar">
+          <div class="brand"><span class="brand-mark">拾</span><span>拾词</span></div>
+          <nav class="top-nav" aria-label="主导航">
+            <button class="active" type="button" data-view="all"><span>词库</span><small id="all-count">0</small></button>
+            <button type="button" data-view="review"><span>复习</span><small id="review-count">0</small></button>
+            <button type="button" data-view="starred"><span>收藏</span><small id="star-count">0</small></button>
+          </nav>
+          <div class="topbar-actions">
+            <label class="search-box">
+              <i data-lucide="search" aria-hidden="true"></i>
+              <input id="search-input" type="search" placeholder="搜索片段、解释或来源" autocomplete="off" />
+              <button class="icon-button search-clear" type="button" data-action="clear-search" aria-label="清除搜索">
+                <i data-lucide="x" aria-hidden="true"></i>
+              </button>
+            </label>
+            <button class="icon-button" type="button" data-action="settings" aria-label="设置">
+              <i data-lucide="settings-2" aria-hidden="true"></i>
+            </button>
+          </div>
+        </header>
+
+        <section class="composer-shell" aria-label="输入语言片段">
+          <div class="context-bar" id="context-bar" hidden>
+            <div class="context-copy">
+              <span class="pulse-dot"></span>
+              <span>正在追问</span>
+              <strong id="context-title"></strong>
+            </div>
+            <div class="context-actions">
+              <button type="button" class="text-button" data-action="new-fragment">新片段</button>
+              <button type="button" class="icon-button" data-action="new-fragment" aria-label="结束追问">
+                <i data-lucide="x" aria-hidden="true"></i>
+              </button>
+            </div>
+          </div>
+          <form class="composer" id="composer">
+            <textarea id="fragment-input" rows="2" maxlength="5000" placeholder="贴入一个不懂的词、短语或句子…"></textarea>
+            <div class="composer-row">
+              <label class="source-picker">
+                <i data-lucide="tag" aria-hidden="true"></i>
+                <select id="source-select" aria-label="片段来源">
+                  <option value="">不标记来源</option>
+                  <option value="日常">日常</option>
+                  <option value="阅读">阅读</option>
+                  <option value="影视">影视</option>
+                  <option value="工作">工作</option>
+                  <option value="游戏">游戏</option>
+                  <option value="网页">网页</option>
+                  <option value="聊天">聊天</option>
+                  <option value="其他">其他</option>
+                </select>
+              </label>
+              <div class="composer-meta">
+                <span class="ai-state" id="ai-state"><span></span>检测中</span>
+                <button class="send-button" id="send-button" type="submit" aria-label="发送">
+                  <i data-lucide="arrow-up" aria-hidden="true"></i>
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
+
+        <section class="library-head" id="library-head">
+          <div>
+            <h1 id="view-title">片段词库</h1>
+            <p id="view-subtitle">按需展开解释，快速扫描与整理</p>
+          </div>
+          <div class="source-summary" aria-label="按来源筛选">
+            <div id="source-filters"></div>
+          </div>
+        </section>
+
+        <section class="timeline" id="timeline" aria-live="polite"></section>
+
+        <nav class="bottom-nav" aria-label="移动端导航">
+          <button class="active" type="button" data-view="all"><i data-lucide="library"></i><span>词库</span></button>
+          <button type="button" data-view="review"><i data-lucide="history"></i><span>复习</span></button>
+          <button type="button" data-view="starred"><i data-lucide="star"></i><span>收藏</span></button>
+        </nav>
+      </main>
+    </div>
+
+    <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-title">
+      <div id="detail-content"></div>
+    </dialog>
+
+    <dialog id="settings-dialog">
+      <div class="dialog-header">
+        <div><h2>设置</h2><p>外观、AI Provider 与本地数据。</p></div>
+        <button class="icon-button" type="button" data-action="close-settings" aria-label="关闭"><i data-lucide="x"></i></button>
+      </div>
+      <section class="settings-list appearance-settings" aria-labelledby="appearance-title">
+        <div class="settings-section-title"><h3 id="appearance-title">外观</h3></div>
+        <fieldset class="setting-field appearance-theme">
+          <legend>主题</legend>
+          <div class="segmented-control three-options">
+            <label><input type="radio" name="theme" value="system" /><span>跟随系统</span></label>
+            <label><input type="radio" name="theme" value="light" /><span>浅色</span></label>
+            <label><input type="radio" name="theme" value="dark" /><span>深色</span></label>
+          </div>
+        </fieldset>
+        <label class="setting-field font-setting">
+          <span>字号 <output id="font-scale-value">100%</output></span>
+          <input id="font-scale" type="range" min="90" max="120" step="5" value="100" />
+        </label>
+      </section>
+      <form id="config-form" class="config-form">
+        <div class="settings-list">
+          <div class="settings-section-title"><h3>AI Provider</h3></div>
+          <div class="setting-row"><div><strong>AI 状态</strong><p id="settings-ai-copy">检测中</p></div><span class="status-pill" id="settings-ai-pill">检测中</span></div>
+          <div class="provider-switcher">
+            <label><span>当前 Provider</span><select id="provider-select" aria-label="当前 Provider"></select></label>
+            <button class="icon-button" type="button" data-action="new-provider" aria-label="新增 Provider" title="新增 Provider"><i data-lucide="plus"></i></button>
+            <button class="icon-button danger" id="delete-provider" type="button" data-action="delete-provider" aria-label="删除 Provider" title="删除 Provider"><i data-lucide="trash-2"></i></button>
+          </div>
+          <label class="setting-field">
+            <span>Provider 名称</span>
+            <input id="provider-name" type="text" required maxlength="80" placeholder="例如 OpenAI、DeepSeek、本地模型" autocomplete="off" />
+          </label>
+          <fieldset class="setting-field">
+            <legend>API 方式</legend>
+            <div class="segmented-control">
+              <label><input type="radio" name="api-style" value="responses" /><span>Responses API</span></label>
+              <label><input type="radio" name="api-style" value="compatible" /><span>Compatible</span></label>
+            </div>
+            <p class="field-help" id="api-style-help">使用 /v1/responses。</p>
+          </fieldset>
+          <label class="setting-field">
+            <span>Base URL</span>
+            <input id="api-base-url" type="url" required placeholder="https://api.openai.com/v1" autocomplete="url" spellcheck="false" />
+          </label>
+          <label class="setting-field">
+            <span>API Key</span>
+            <span class="input-with-action">
+              <input id="api-key" type="password" placeholder="输入新的 API Key" autocomplete="new-password" spellcheck="false" />
+              <button class="icon-button" type="button" data-action="toggle-key" aria-label="显示 API Key" title="显示或隐藏 API Key"><i data-lucide="eye"></i></button>
+            </span>
+            <small class="field-help" id="api-key-help">密钥只保存在本机服务端。</small>
+          </label>
+          <label class="checkbox-row">
+            <input id="allow-no-key" type="checkbox" />
+            <span>此服务不需要 API Key</span>
+          </label>
+          <label class="setting-field">
+            <span>模型</span>
+            <span class="input-with-action">
+              <input id="api-model" type="text" required list="model-options" placeholder="选择或直接输入模型 ID" autocomplete="off" spellcheck="false" />
+              <datalist id="model-options"></datalist>
+              <button class="icon-button" id="refresh-models" type="button" aria-label="获取模型列表" title="从 /v1/models 获取模型"><i data-lucide="refresh-cw"></i></button>
+            </span>
+            <small class="field-help" id="model-list-state">可以直接填写接口未列出的模型。</small>
+          </label>
+          <div class="config-message" id="config-message" role="status"></div>
+        </div>
+        <div class="config-actions">
+          <button class="primary-button" type="submit"><i data-lucide="save"></i>保存 Provider</button>
+        </div>
+      </form>
+      <div class="settings-list data-settings">
+        <div class="setting-row"><div><strong>本地片段库</strong><p>解释、来源、复习状态与追问均保存在本机</p></div><span id="settings-count">0</span></div>
+      </div>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="button" data-action="export"><i data-lucide="download"></i>导出 JSON</button>
+        <button class="secondary-button danger" type="button" data-action="reset"><i data-lucide="rotate-ccw"></i>恢复演示数据</button>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/vendor/lucide.min.js?v=8"></script>
+    <script type="module" src="/app.js?v=8"></script>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "shici",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build",
+    "check": "node --check server.mjs && node --check public/app.js && node --check test/smoke.mjs",
+    "test": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
