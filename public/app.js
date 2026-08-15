@@ -3,6 +3,7 @@ const APPEARANCE_KEY = "shici:appearance";
 const now = Date.now();
 const sourceOptions = ["日常", "阅读", "影视", "工作", "游戏", "网页", "聊天", "其他"];
 const kindLabels = { word: "单词", word_list: "词表", phrase: "短语", sentence: "句子", other: "片段" };
+const shortcutLabels = { "mod-enter": "⌘/Ctrl + Enter", "shift-enter": "Shift + Enter", enter: "Enter" };
 
 function readAppearance() {
   try {
@@ -10,8 +11,9 @@ function readAppearance() {
     return {
       theme: ["system", "light", "dark"].includes(value.theme) ? value.theme : "system",
       fontScale: Math.min(120, Math.max(90, Number(value.fontScale) || 100)),
+      sendShortcut: Object.hasOwn(shortcutLabels, value.sendShortcut) ? value.sendShortcut : "mod-enter",
     };
-  } catch { return { theme: "system", fontScale: 100 }; }
+  } catch { return { theme: "system", fontScale: 100, sendShortcut: "mod-enter" }; }
 }
 
 const appearance = readAppearance();
@@ -97,33 +99,51 @@ const state = {
   query: "",
   sourceFilter: "",
   activeThreadId: null,
-  expanded: new Set(),
+  selectedEntryId: null,
+  detailClosed: false,
+  detailOpened: false,
   visibleLimit: 80,
   reviewReveal: false,
   reviewSessionTotal: 0,
   reviewFocusId: null,
   ai: { mode: "checking", model: "", apiStyle: "responses" },
   busy: true,
+  activeRequest: null,
   storageReady: false,
 };
+const searchCache = new WeakMap();
+let searchTimer;
 
 const elements = {
   timeline: document.querySelector("#timeline"),
   workspace: document.querySelector(".workspace"),
   bottomNav: document.querySelector(".bottom-nav"),
   composerShell: document.querySelector(".composer-shell"),
+  captureGrid: document.querySelector(".capture-grid"),
+  capturePage: document.querySelector("#capture-page"),
+  captureComposer: document.querySelector("#capture-composer"),
+  captureInput: document.querySelector("#capture-input"),
+  captureSource: document.querySelector("#capture-source-select"),
+  captureSend: document.querySelector("#capture-send"),
   libraryHead: document.querySelector("#library-head"),
   composer: document.querySelector("#composer"),
   input: document.querySelector("#fragment-input"),
   source: document.querySelector("#source-select"),
-  sourceFilters: document.querySelector("#source-filters"),
+  filterSelect: document.querySelector("#library-filter-select"),
+  focusCount: document.querySelector("#focus-count"),
+  focusLabel: document.querySelector("#focus-label"),
+  focusProgress: document.querySelector("#focus-progress"),
   send: document.querySelector("#send-button"),
   contextBar: document.querySelector("#context-bar"),
   contextTitle: document.querySelector("#context-title"),
   search: document.querySelector("#search-input"),
   searchBox: document.querySelector(".search-box"),
   aiState: document.querySelector("#ai-state"),
-  detailDialog: document.querySelector("#detail-dialog"),
+  quickModelSelect: document.querySelector("#quick-model-select"),
+  captureQuickModelSelect: document.querySelector("#capture-quick-model-select"),
+  captureAiState: document.querySelector("#capture-ai-state"),
+  detailPanel: document.querySelector("#detail-panel"),
+  detailBackdrop: document.querySelector(".detail-backdrop"),
   detailContent: document.querySelector("#detail-content"),
   dialog: document.querySelector("#settings-dialog"),
   toast: document.querySelector("#toast"),
@@ -141,17 +161,37 @@ const elements = {
   refreshModels: document.querySelector("#refresh-models"),
   fontScale: document.querySelector("#font-scale"),
   fontScaleValue: document.querySelector("#font-scale-value"),
+  sendShortcut: document.querySelector("#send-shortcut"),
+  importJson: document.querySelector("#import-json"),
 };
 
 async function apiFetch(url, options = {}) {
   const invoke = window.__TAURI__?.core?.invoke;
-  if (!invoke) return fetch(url, options);
+  const { requestId = "", ...requestOptions } = options;
+  if (!invoke) {
+    const headers = new Headers(requestOptions.headers);
+    headers.set("X-Shici", "1");
+    return fetch(url, { ...requestOptions, headers });
+  }
 
   let body = {};
-  if (typeof options.body === "string" && options.body) body = JSON.parse(options.body);
-  const result = await invoke("api_request", {
-    request: { url, method: options.method || "GET", body },
+  if (typeof requestOptions.body === "string" && requestOptions.body) body = JSON.parse(requestOptions.body);
+  const invocation = invoke("api_request", {
+    request: { url, method: requestOptions.method || "GET", body, requestId },
   });
+  let result;
+  if (requestOptions.signal) {
+    if (requestOptions.signal.aborted) throw new DOMException("请求已暂停", "AbortError");
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(new DOMException("请求已暂停", "AbortError"));
+      requestOptions.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try { result = await Promise.race([invocation, aborted]); }
+    finally { requestOptions.signal.removeEventListener("abort", onAbort); }
+  } else {
+    result = await invocation;
+  }
   return new Response(JSON.stringify(result.body), {
     status: result.status,
     headers: { "Content-Type": "application/json" },
@@ -181,6 +221,7 @@ async function load() {
     }
   }
   state.entries = Array.isArray(result.entries) ? result.entries : [];
+  state.selectedEntryId ||= state.entries[0]?.id || null;
   state.storageReady = true;
   localStorage.removeItem(STORAGE_KEY);
 }
@@ -221,7 +262,7 @@ function dayKey(timestamp) {
 }
 
 function reviewState(entry) {
-  return entry.review || { dueAt: entry.createdAt, intervalDays: 0, ease: 2.5, repetitions: 0, lapses: 0 };
+  return entry.review || { dueAt: entry.createdAt, intervalDays: 0, ease: 2.5, repetitions: 0, lapses: 0, leech: false };
 }
 
 function isDue(entry, at = Date.now()) {
@@ -244,10 +285,15 @@ function formatInterval(days) {
 
 function previewInterval(entry, grade) {
   const review = reviewState(entry);
-  if (grade === "again") return 10 / 1_440;
-  if (grade === "hard") return review.repetitions === 0 ? 1 : Math.max(1, review.intervalDays * 1.2);
-  if (grade === "easy") return review.repetitions === 0 ? 4 : review.repetitions === 1 ? 8 : Math.max(8, review.intervalDays * (review.ease + 0.15) * 1.3);
-  return review.repetitions === 0 ? 1 : review.repetitions === 1 ? 3 : Math.max(3, review.intervalDays * review.ease);
+  let interval = grade === "again"
+    ? 10 / 1_440
+    : grade === "hard"
+      ? review.repetitions === 0 ? 1 : Math.max(1, review.intervalDays * 1.2)
+      : grade === "easy"
+        ? review.repetitions === 0 ? 4 : review.repetitions === 1 ? 8 : Math.max(8, review.intervalDays * (review.ease + 0.15) * 1.3)
+        : review.repetitions === 0 ? 1 : review.repetitions === 1 ? 3 : Math.max(3, review.intervalDays * review.ease);
+  if (review.repetitions + (grade === "hard" ? 0 : 1) > 1 && grade !== "again") interval *= 0.9 + (Math.floor(Date.now() / 60_000) % 21) / 100;
+  return Math.round(interval * 100) / 100;
 }
 
 function dueLabel(entry) {
@@ -263,7 +309,11 @@ function filteredEntries() {
     if (state.view === "starred" && !entry.starred) return false;
     if (state.sourceFilter && entry.source !== state.sourceFilter) return false;
     if (!query) return true;
-    const haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning])].join(" ").toLowerCase();
+    let haystack = searchCache.get(entry);
+    if (!haystack) {
+      haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning])].join(" ").toLowerCase();
+      searchCache.set(entry, haystack);
+    }
     return haystack.includes(query);
   });
 }
@@ -271,9 +321,11 @@ function filteredEntries() {
 function renderThread(entry) {
   if (!entry.thread?.length) return "";
   return `<div class="thread-panel">
-    ${entry.thread.map((turn) => `<div class="thread-turn">
+    <div class="thread-head"><span>${entry.thread.length} 轮追问</span><button class="thread-rewind" type="button" data-action="rewind-thread" data-id="${entry.id}" data-turn-id="" aria-label="回到原片段" title="清空追问，回到原片段">${icon("undo-2")}</button></div>
+    ${entry.thread.map((turn, index) => `<div class="thread-turn">
       <span class="turn-mark">你</span><div class="turn-copy"><strong>追问</strong>${escapeHtml(turn.question)}</div>
       <span class="turn-mark ai">AI</span><div class="turn-copy"><strong>回答</strong>${escapeHtml(turn.answer)}</div>
+      ${index < entry.thread.length - 1 ? `<button class="thread-rewind" type="button" data-action="rewind-thread" data-id="${entry.id}" data-turn-id="${turn.id}" aria-label="回退到第 ${index + 1} 轮" title="保留这一轮，移除之后的追问">${icon("undo-2")}</button>` : ""}
     </div>`).join("")}
   </div>`;
 }
@@ -289,108 +341,114 @@ function renderSourcePicker(entry) {
   </label>`;
 }
 
-function openEntryDetail(entry) {
-  const usage = entry.usage?.length
-    ? `<section class="detail-section"><span>用法与例句</span><ul>${entry.usage.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></section>`
-    : "";
-  const chunks = entry.chunks?.length
-    ? `<section class="detail-section"><span>表达拆解</span><div class="detail-chunks">${entry.chunks.map((chunk) => `<div><strong>${escapeHtml(chunk.text)}</strong><p>${escapeHtml(chunk.meaning)}</p></div>`).join("")}</div></section>`
+function renderDetailPanel() {
+  const entry = state.entries.find((item) => item.id === state.selectedEntryId);
+  const mobile = matchMedia("(max-width: 760px)").matches;
+  const visible = Boolean(entry) && state.view !== "review" && (!mobile || state.detailOpened);
+  elements.detailPanel.hidden = !visible;
+  elements.detailBackdrop.hidden = !visible;
+  if (!visible) {
+    elements.detailContent.innerHTML = "";
+    return;
+  }
+
+  const displayText = entry.displayText || entry.raw;
+  const review = reviewState(entry);
+  const original = entry.raw !== displayText
+    ? `<section class="detail-section"><span>原始输入</span><p class="detail-original">${escapeHtml(entry.raw)}</p></section>`
     : "";
   const words = entry.words?.length
     ? `<section class="detail-section"><span>${entry.kind === "word_list" ? "逐词理解" : "读音"}</span>${renderWords(entry, "detail-words")}</section>`
     : "";
+  const usage = entry.usage?.length
+    ? `<section class="detail-section"><span>语境 / 例句</span><div class="detail-quote">${entry.usage.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div></section>`
+    : "";
+  const chunks = entry.chunks?.length
+    ? `<section class="detail-section"><span>表达拆解</span><div class="detail-chunks">${entry.chunks.map((chunk) => `<div><strong>${escapeHtml(chunk.text)}</strong><p>${escapeHtml(chunk.meaning)}</p></div>`).join("")}</div></section>`
+    : "";
   const thread = entry.thread?.length
-    ? `<section class="detail-section"><span>围绕这个片段的追问</span><div class="detail-thread">${entry.thread.map((turn) => `<div><strong>你</strong><p>${escapeHtml(turn.question)}</p><strong>AI</strong><p>${escapeHtml(turn.answer)}</p></div>`).join("")}</div></section>`
+    ? `<section class="detail-section"><span>追问记录</span>${renderThread(entry)}</section>`
     : "";
-  const displayText = entry.displayText || entry.raw;
-  const original = entry.raw !== displayText
-    ? `<section class="detail-section"><span>原始输入</span><p class="detail-original">${escapeHtml(entry.raw)}</p></section>`
-    : "";
-  const review = reviewState(entry);
+
   elements.detailContent.innerHTML = `
     <article class="detail-sheet">
       <div class="detail-toolbar">
-        <span>${icon("languages")}${kindLabels[entry.kind] || "完整片段"}</span>
-        <button class="icon-button" type="button" data-action="close-detail" aria-label="关闭完整卡片">${icon("x")}</button>
+        <span>详细信息</span>
+        <button class="icon-button" type="button" data-action="close-detail" aria-label="关闭详情">${icon("x")}</button>
       </div>
-      <header class="detail-hero">
-        <div class="detail-badges">
-          ${entry.source ? `<span>${icon("tag")}${escapeHtml(entry.source)}</span>` : ""}
-          <span class="${isDue(entry) ? "is-due" : ""}">${icon("history")}${dueLabel(entry)}</span>
-        </div>
-        <h2 id="detail-title">${escapeHtml(displayText)}</h2>
-        ${entry.pronunciation ? `<p class="detail-pronunciation">${escapeHtml(entry.pronunciation)}</p>` : ""}
-        ${entry.correction ? `<p class="detail-correction">已按 ${escapeHtml(entry.correction)} 理解</p>` : ""}
-      </header>
-      <div class="detail-layout">
-        <main>
+      <div class="detail-scroll">
+        <header class="detail-hero">
+          <h2 id="detail-title">${escapeHtml(displayText)}</h2>
+          <div class="detail-badges">
+            <span>${kindLabels[entry.kind] || "片段"}</span>
+            ${entry.pronunciation ? `<span>${escapeHtml(entry.pronunciation)}</span>` : ""}
+            ${entry.source ? `<span>${escapeHtml(entry.source)}</span>` : ""}
+          </div>
+          ${entry.correction ? `<p class="detail-correction">已纠正：${escapeHtml(entry.correction)}</p>` : ""}
+        </header>
+        <main class="detail-body">
           <section class="detail-section detail-meaning">
-            <span>在这里的理解</span>
+            <span>释义</span>
             <h3>${escapeHtml(entry.meaning)}</h3>
-            ${entry.context ? `<p>${escapeHtml(entry.context)}</p>` : ""}
           </section>
-          ${original}${words}${usage}${chunks}${thread}
+          ${original}${words}${usage}${chunks}
+          ${entry.context ? `<section class="ai-explanation"><span>${icon("sparkles")}AI 理解</span><p>${escapeHtml(entry.context)}</p>${entry.conclusion && entry.conclusion !== entry.context ? `<p>${escapeHtml(entry.conclusion)}</p>` : ""}</section>` : ""}
+          ${thread}
+          <section class="detail-meta">
+            <span>学习记录</span>
+            <dl>
+              <div><dt>收录</dt><dd>${formatTime(entry.createdAt)}</dd></div>
+              <div><dt>复习</dt><dd>${review.repetitions || 0} 次</dd></div>
+              <div><dt>下次</dt><dd>${dueLabel(entry)}</dd></div>
+              <div><dt>状态</dt><dd>${review.leech ? "顽固词" : entry.status === "review" ? "待复习" : "已学习"}</dd></div>
+              <div><dt>难度</dt><dd>${Number(review.ease || 2.5).toFixed(1)}</dd></div>
+            </dl>
+          </section>
         </main>
-        <aside class="detail-meta">
-          <span>学习记录</span>
-          <dl>
-            <div><dt>收录时间</dt><dd>${formatTime(entry.createdAt)}</dd></div>
-            <div><dt>复习次数</dt><dd>${review.repetitions || 0}</dd></div>
-            <div><dt>当前间隔</dt><dd>${review.repetitions ? formatInterval(review.intervalDays) : "尚未开始"}</dd></div>
-            <div><dt>记忆难度</dt><dd>${Number(review.ease || 2.5).toFixed(1)}</dd></div>
-          </dl>
-        </aside>
       </div>
       <footer class="detail-actions">
-        ${isDue(entry) ? `<button class="secondary-button" type="button" data-action="start-review" data-id="${entry.id}">${icon("brain")}现在复习</button>` : ""}
-        <button class="primary-button" type="button" data-action="continue" data-id="${entry.id}">${icon("message-circle-more")}针对片段追问</button>
+        ${renderSourcePicker(entry)}
+        <span class="detail-action-icons">
+          <button class="icon-button ${entry.starred ? "starred" : ""}" type="button" data-action="star" data-id="${entry.id}" aria-label="${entry.starred ? "取消收藏" : "收藏"}">${icon("star")}</button>
+          <button class="icon-button" type="button" data-action="delete" data-id="${entry.id}" aria-label="删除片段">${icon("trash-2")}</button>
+        </span>
+        ${isDue(entry) ? `<button class="secondary-button" type="button" data-action="start-review" data-id="${entry.id}">${icon("brain")}复习</button>` : ""}
+        <button class="primary-button" type="button" data-action="continue" data-id="${entry.id}">${icon("message-circle-more")}追问</button>
       </footer>
     </article>`;
-  if (!elements.detailDialog.open) elements.detailDialog.showModal();
   refreshIcons();
 }
 
+function openEntryDetail(entry) {
+  const previousId = state.selectedEntryId;
+  state.selectedEntryId = entry.id;
+  state.detailClosed = false;
+  state.detailOpened = true;
+  if (previousId !== entry.id) {
+    for (const id of [previousId, entry.id]) {
+      if (!id) continue;
+      const card = elements.timeline.querySelector(`[data-entry-id="${CSS.escape(id)}"]`);
+      const current = state.entries.find((item) => item.id === id);
+      if (card && current) card.outerHTML = renderEntry(current);
+    }
+    refreshIcons();
+  }
+  renderDetailPanel();
+}
+
 function renderEntry(entry) {
-  const isExpanded = state.expanded.has(entry.id) || state.activeThreadId === entry.id;
-  const usage = entry.usage?.length ? `<ul class="usage-list">${entry.usage.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : "";
-  const chunks = entry.chunks?.length ? `<div class="chunk-row">${entry.chunks.map((chunk) => `<span class="chunk"><strong>${escapeHtml(chunk.text)}</strong>${escapeHtml(chunk.meaning)}</span>`).join("")}</div>` : "";
-  const words = entry.kind === "word_list" ? renderWords(entry, "word-list-preview") : "";
-  const threadToggle = entry.thread?.length ? `<button type="button" data-action="toggle-thread" data-id="${entry.id}">${icon("messages-square")}${entry.thread.length}</button>` : "";
-  return `<article class="entry-card ${isExpanded ? "expanded" : ""} ${isDue(entry) ? "due" : ""}" data-entry-id="${entry.id}">
-    <div class="entry-main">
-      <div class="entry-head">
-        <button class="expand-button" type="button" data-action="toggle-details" data-id="${entry.id}" aria-label="${isExpanded ? "收起详情" : "展开详情"}">${icon(isExpanded ? "chevron-down" : "chevron-right")}</button>
-        <div class="entry-title-wrap">
-          <button class="entry-title-button" type="button" data-action="open-detail" data-id="${entry.id}" title="查看完整卡片">
-            <h2 class="entry-title">${escapeHtml(entry.displayText || entry.raw)}${entry.pronunciation ? `<span class="pronunciation">${escapeHtml(entry.pronunciation)}</span>` : ""}</h2>
-          </button>
-          ${entry.correction ? `<div class="correction">已按 ${escapeHtml(entry.correction)} 理解</div>` : ""}
-        </div>
-        <p class="entry-meaning">${escapeHtml(entry.meaning)}</p>
-        <div class="row-source">${renderSourcePicker(entry)}</div>
-        <span class="review-due ${isDue(entry) ? "is-due" : ""}">${dueLabel(entry)}</span>
-        <div class="entry-tools">
-          <button class="icon-button open-detail-button" type="button" data-action="open-detail" data-id="${entry.id}" aria-label="查看完整卡片">${icon("maximize-2")}</button>
-          <button class="icon-button ${entry.starred ? "starred" : ""}" type="button" data-action="star" data-id="${entry.id}" aria-label="${entry.starred ? "取消收藏" : "收藏"}">${icon("star")}</button>
-          <button class="icon-button" type="button" data-action="delete" data-id="${entry.id}" aria-label="删除片段">${icon("trash-2")}</button>
-        </div>
-      </div>
-      <div class="entry-details">
-        <div class="entry-details-inner">
-          <p class="entry-context">${escapeHtml(entry.context)}</p>
-          ${words}${usage}${chunks}
-          <div class="entry-footer">
-            <div class="entry-meta"><span>${formatTime(entry.createdAt)}</span><span>${reviewState(entry).repetitions ? `当前间隔 ${formatInterval(reviewState(entry).intervalDays)}` : "尚未完成首次复习"}</span></div>
-            <div class="entry-actions">
-              ${threadToggle}
-              ${isDue(entry) ? `<button type="button" data-action="start-review" data-id="${entry.id}">${icon("brain")}现在复习</button>` : ""}
-              <button class="continue-button" type="button" data-action="continue" data-id="${entry.id}">${icon("message-circle-more")}针对片段追问</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    ${isExpanded ? renderThread(entry) : ""}
+  const selected = state.selectedEntryId === entry.id;
+  const meta = entry.pronunciation || entry.meaning || kindLabels[entry.kind] || "语言片段";
+  return `<article class="entry-card ${selected ? "selected" : ""} ${isDue(entry) ? "due" : ""}" data-entry-id="${entry.id}">
+    <button class="entry-row" type="button" data-action="open-detail" data-id="${entry.id}" aria-pressed="${selected}">
+      <span class="entry-check" aria-hidden="true"></span>
+      <span class="entry-row-copy">
+        <strong>${escapeHtml(entry.displayText || entry.raw)}</strong>
+        <span><em>${escapeHtml(meta)}</em><i>${entry.source ? escapeHtml(entry.source) : kindLabels[entry.kind] || "片段"} · ${entry.status === "review" ? (isDue(entry) ? "待复习" : "待安排") : (isDue(entry) ? "已到期" : "已学习")}${reviewState(entry).leech ? " · 顽固词" : ""}</i></span>
+        ${entry.correction ? `<small>已纠正 ${escapeHtml(entry.correction)}</small>` : ""}
+      </span>
+      ${icon(selected ? "chevron-down" : "chevron-right")}
+    </button>
   </article>`;
 }
 
@@ -430,70 +488,114 @@ function renderReview() {
 }
 
 function renderTimeline() {
+  if (state.view === "capture") {
+    elements.timeline.innerHTML = "";
+    elements.detailPanel.hidden = true;
+    elements.detailBackdrop.hidden = true;
+    return;
+  }
   if (state.view === "review") {
     elements.timeline.innerHTML = renderReview();
+    renderDetailPanel();
     refreshIcons();
     return;
   }
   const entries = filteredEntries();
   const visible = entries.slice(0, state.visibleLimit);
+  if (!state.detailClosed && !entries.some((entry) => entry.id === state.selectedEntryId)) state.selectedEntryId = visible[0]?.id || null;
   let html = "";
-  if (state.busy) html += `<div class="loading-line"></div>`;
   if (!entries.length) {
     html += `<div class="timeline-inner"><div class="empty-state"><div>${icon("search-x")}<h2>没有找到片段</h2><p>换一个筛选条件，或捕捉新的语言片段。</p></div></div></div>`;
   } else {
-    html += `<div class="timeline-inner"><div class="list-columns"><span>片段与解释</span><span>来源</span><span>复习时间</span><span></span></div><div class="entry-list">${visible.map(renderEntry).join("")}</div>${entries.length > visible.length ? `<button class="load-more" type="button" data-action="load-more">再显示 ${Math.min(80, entries.length - visible.length)} 条</button>` : ""}</div>`;
+    html += `<div class="timeline-inner"><div class="list-columns"><span>片段与解释</span><span>状态</span></div><div class="entry-list">${visible.map(renderEntry).join("")}</div>${entries.length > visible.length ? `<button class="load-more" type="button" data-action="load-more">再显示 ${Math.min(80, entries.length - visible.length)} 条</button>` : ""}</div>`;
   }
   elements.timeline.innerHTML = html;
+  renderDetailPanel();
   refreshIcons();
 }
 
 function renderNavigation() {
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
-  document.querySelectorAll("[data-source-filter]").forEach((button) => button.classList.toggle("active", button.dataset.sourceFilter === state.sourceFilter));
   const reviewCount = dueEntries().length;
   const starCount = state.entries.filter((entry) => entry.starred).length;
   document.querySelector("#all-count").textContent = state.entries.length;
   document.querySelector("#review-count").textContent = reviewCount;
   document.querySelector("#star-count").textContent = starCount;
+  elements.focusCount.textContent = reviewCount;
+  elements.focusLabel.textContent = reviewCount ? "今日待复习" : "今日已清空";
+  elements.focusProgress.style.width = `${state.entries.length ? Math.max(8, Math.min(100, (reviewCount / state.entries.length) * 100)) : 100}%`;
   const copy = {
-    all: ["片段词库", state.sourceFilter ? `${state.sourceFilter} · ${filteredEntries().length} 条` : `${state.entries.length} 个散落在不同场景里的语言片段`],
+    all: ["词库", state.sourceFilter ? `${state.sourceFilter} · ${filteredEntries().length} 条` : `${state.entries.length} 个散落在不同场景里的语言片段`],
     review: ["专注复习", "根据你的回忆质量安排下一次出现"],
     starred: ["收藏片段", `${starCount} 个主动保留的重点`],
+    capture: ["记录", ""],
   }[state.view];
   document.querySelector("#view-title").textContent = copy[0];
   document.querySelector("#view-subtitle").textContent = copy[1];
   document.querySelector("#settings-count").textContent = state.entries.length;
   const sources = [...new Set(state.entries.map((entry) => entry.source).filter(Boolean))];
-  elements.sourceFilters.innerHTML = sources.length
-    ? sources.map((source) => `<button type="button" data-source-filter="${escapeHtml(source)}" class="${state.sourceFilter === source ? "active" : ""}"><span class="source-dot"></span>${escapeHtml(source)}</button>`).join("")
-    : `<span class="source-empty">还没有已标记来源</span>`;
-  elements.composerShell.hidden = state.view === "review";
+  elements.filterSelect.innerHTML = `<option value="all">全部</option><option value="starred">收藏 (${starCount})</option>${sources.map((source) => `<option value="source:${escapeHtml(source)}">${escapeHtml(source)}</option>`).join("")}`;
+  elements.filterSelect.value = state.view === "starred" ? "starred" : state.sourceFilter ? `source:${state.sourceFilter}` : "all";
+  elements.captureGrid.hidden = state.view === "review";
   elements.libraryHead.hidden = state.view === "review";
-  elements.searchBox.hidden = state.view === "review";
-  elements.bottomNav.hidden = state.view === "review";
+  elements.capturePage.hidden = state.view !== "capture";
+  elements.searchBox.hidden = state.view === "review" || state.view === "capture";
+  elements.bottomNav.hidden = state.view === "review" || state.view === "capture";
   document.body.classList.toggle("review-mode", state.view === "review");
+  document.body.classList.toggle("capture-mode", state.view === "capture");
+  const recordButton = document.querySelector('[data-action="focus-composer"]');
+  recordButton?.classList.toggle("active", state.view === "capture");
 }
 
 function renderComposer() {
   const entry = state.entries.find((item) => item.id === state.activeThreadId);
+  const stopping = Boolean(state.activeRequest);
   if (!entry) state.activeThreadId = null;
   elements.contextBar.hidden = !entry;
   elements.contextTitle.textContent = entry ? `· ${entry.displayText || entry.raw}` : "";
-  elements.input.placeholder = entry ? "继续追问这个片段…" : "贴入一个不懂的词、短语或句子…";
+  elements.input.placeholder = entry ? "继续追问这个片段…" : "记录一个不懂的词、短语或句子…";
   elements.source.disabled = Boolean(entry);
-  elements.send.disabled = state.busy || !state.storageReady;
+  elements.composer.classList.toggle("processing", stopping);
+  elements.send.disabled = !state.storageReady || (state.busy && !stopping);
+  elements.send.classList.toggle("stop", stopping);
+  elements.send.setAttribute("aria-label", stopping ? "停止生成" : `发送（${shortcutLabels[appearance.sendShortcut]}）`);
+  elements.send.title = stopping ? "停止生成" : `发送：${shortcutLabels[appearance.sendShortcut]}`;
+  elements.send.innerHTML = stopping ? icon("square") : "保存";
+  renderAiState();
+}
+
+function renderCapturePage() {
+  const stopping = Boolean(state.activeRequest);
+  elements.captureComposer.classList.toggle("processing", stopping);
+  elements.captureSend.disabled = !state.storageReady || (state.busy && !stopping);
+  elements.captureSend.classList.toggle("stop", stopping);
+  elements.captureSend.setAttribute("aria-label", stopping ? "停止生成" : `发送（${shortcutLabels[appearance.sendShortcut]}）`);
+  elements.captureSend.title = stopping ? "停止生成" : `发送：${shortcutLabels[appearance.sendShortcut]}`;
+  elements.captureSend.innerHTML = stopping ? icon("square") : "保存到词库";
 }
 
 function render() {
   renderNavigation();
   renderTimeline();
   renderComposer();
+  renderCapturePage();
   refreshIcons();
 }
 
-function toast(message) {
-  elements.toast.textContent = message;
+function toast(message, action) {
+  elements.toast.replaceChildren(document.createTextNode(message));
+  elements.toast.classList.toggle("has-action", Boolean(action));
+  if (action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toast-action";
+    button.textContent = action.label;
+    button.addEventListener("click", () => {
+      elements.toast.classList.remove("visible", "has-action");
+      action.run().catch((error) => toast(error.message || "撤销失败"));
+    }, { once: true });
+    elements.toast.append(button);
+  }
   elements.toast.classList.add("visible");
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => elements.toast.classList.remove("visible"), 2600);
@@ -533,13 +635,52 @@ function showConfigMessage(message, isError = false) {
   elements.configMessage.classList.toggle("error", isError);
 }
 
-function applyAiStatus(config, fillForm = false) {
-  state.ai = config;
+function renderAiState() {
+  const targets = [elements.aiState, elements.captureAiState].filter(Boolean);
+  const setTargets = (className, html, title) => targets.forEach((target) => {
+    target.className = `ai-state${className ? ` ${className}` : ""}`;
+    target.innerHTML = html;
+    target.title = title;
+  });
+  if (state.activeRequest) {
+    setTargets("processing", `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>${state.activeThreadId ? "正在整理追问" : "正在理解片段"}`, "正在等待模型返回，可点击停止按钮取消");
+    elements.aiState.hidden = false;
+    elements.captureAiState.hidden = false;
+    elements.quickModelSelect.hidden = true;
+    elements.captureQuickModelSelect.hidden = true;
+    return;
+  }
+  const config = state.ai;
+  if (config.mode === "checking") {
+    setTargets("", `<span class="status-dot"></span>检测中`, "正在检查 AI 配置");
+    elements.aiState.hidden = false;
+    elements.captureAiState.hidden = false;
+    elements.quickModelSelect.hidden = true;
+    elements.captureQuickModelSelect.hidden = true;
+    return;
+  }
   const live = config.mode === "live";
   const styleName = config.apiStyle === "compatible" ? "Compatible" : "Responses";
-  elements.aiState.className = `ai-state ${live ? "live" : "demo"}`;
-  elements.aiState.innerHTML = `<span></span>${live ? escapeHtml(config.model) : "演示模式"}`;
-  elements.aiState.title = live ? `${config.providerName} · ${styleName} · ${config.model}` : "打开设置完成 AI 配置";
+  const label = live ? escapeHtml(config.model || "未填写模型") : "演示模式";
+  const title = live ? `${config.providerName} · ${styleName} · ${config.model}` : "打开设置完成 AI 配置";
+  setTargets(live ? "live" : "demo", `<span class="status-dot"></span>${label}`, title);
+  const providers = Array.isArray(config.providers) ? config.providers : [];
+  const options = providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.model || "未填写模型")} · ${escapeHtml(provider.name)}</option>`).join("");
+  for (const select of [elements.quickModelSelect, elements.captureQuickModelSelect]) {
+    select.innerHTML = options;
+    select.value = config.providerId || "";
+    select.title = title;
+    select.hidden = providers.length === 0;
+  }
+  elements.aiState.hidden = providers.length > 0;
+  elements.captureAiState.hidden = providers.length > 0;
+}
+
+function applyAiStatus(config, fillForm = false) {
+  state.ai = config;
+  renderAiState();
+  const live = config.mode === "live";
+  const styleName = config.apiStyle === "compatible" ? "Compatible" : "Responses";
   const pill = document.querySelector("#settings-ai-pill");
   pill.className = `status-pill ${live ? "live" : "demo"}`;
   pill.textContent = live ? "已配置" : "演示模式";
@@ -649,11 +790,11 @@ function newProvider() {
   elements.providerName.focus();
 }
 
-async function activateProvider() {
-  const id = elements.providerSelect.value;
+async function activateProvider(providerId = elements.providerSelect.value, fillForm = true) {
+  const id = providerId;
   if (!id) return newProvider();
   const result = await requestJson(`/api/config/${id}/activate`, { method: "POST" });
-  applyAiStatus(result, true);
+  applyAiStatus(result, fillForm);
   toast(`已切换到 ${result.providerName}`);
 }
 
@@ -671,41 +812,61 @@ function syncAppearanceControls() {
   if (radio) radio.checked = true;
   elements.fontScale.value = appearance.fontScale;
   elements.fontScaleValue.value = `${appearance.fontScale}%`;
+  elements.sendShortcut.value = appearance.sendShortcut;
 }
 
 async function submitFragment(event) {
   event.preventDefault();
-  const text = elements.input.value.trim();
+  const form = event.currentTarget;
+  const input = form.querySelector("textarea");
+  const source = form.querySelector("select");
+  const text = input.value.trim();
   if (!text || state.busy || !state.storageReady) return;
   const active = state.entries.find((entry) => entry.id === state.activeThreadId);
+  const pending = { id: crypto.randomUUID(), controller: new AbortController() };
 
+  state.activeRequest = pending;
   setBusy(true);
   try {
     const result = await requestJson(active ? `/api/entries/${active.id}/followups` : "/api/entries", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(active ? { text } : { text, source: elements.source.value }),
+      body: JSON.stringify(active ? { text } : { text, source: source.value }),
+      signal: pending.controller.signal,
+      requestId: pending.id,
     });
+    if (pending.controller.signal.aborted) return;
     if (active) {
       state.entries[state.entries.findIndex((entry) => entry.id === active.id)] = result.entry;
-      state.expanded.add(active.id);
+      state.selectedEntryId = active.id;
     } else {
       state.entries.unshift(result.entry);
+      state.selectedEntryId = result.entry.id;
       state.view = "all";
       state.sourceFilter = "";
     }
-    elements.input.value = "";
-    elements.input.style.height = "auto";
-    toast(result.demo ? "已保存；当前为演示解释" : "已保存为独立片段");
+    input.value = "";
+    input.style.height = "auto";
+    toast(result.duplicate ? "词库中已有这个片段" : result.demo ? "已保存；当前为演示解释" : "已保存为独立片段");
   } catch (error) {
-    toast(error.message || "解释失败");
+    const stopped = pending.controller.signal.aborted || error.name === "AbortError" || error.message === "请求已暂停";
+    toast(stopped ? "已停止，内容未保存" : (error.message || "解释失败"));
   } finally {
+    if (state.activeRequest?.id === pending.id) state.activeRequest = null;
     setBusy(false);
-    elements.input.focus();
+    (state.view === "capture" ? elements.captureInput : elements.input).focus();
   }
 }
 
+function stopRequest() {
+  const pending = state.activeRequest;
+  if (!pending) return;
+  pending.controller.abort();
+  window.__TAURI__?.core?.invoke("cancel_request", { requestId: pending.id }).catch(() => {});
+}
+
 function newFragment() {
+  stopRequest();
   state.activeThreadId = null;
   state.view = "all";
   elements.input.value = "";
@@ -713,15 +874,60 @@ function newFragment() {
   elements.input.focus();
 }
 
-async function handleAction(action, id, grade) {
+async function rewindThread(entry, turnId) {
+  const turn = entry.thread.find((item) => item.id === turnId);
+  const target = turn ? `第 ${entry.thread.indexOf(turn) + 1} 轮` : "原片段";
+  if (!confirm(`回退到${target}？之后的追问会从本机记录中移除。`)) return;
+  const snapshot = structuredClone(state.entries);
+  const result = await requestJson(`/api/entries/${entry.id}/followups`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ turnId: turnId || "" }),
+  });
+  state.entries[state.entries.indexOf(entry)] = result.entry;
+  state.selectedEntryId = entry.id;
+  toast(`已回退到${target}`, { label: "撤销", run: () => restoreEntries(snapshot) });
+  render();
+}
+
+async function restoreEntries(entries) {
+  const result = await requestJson("/api/entries", {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entries }),
+  });
+  state.entries = result.entries || [];
+  state.selectedEntryId = state.entries.find((entry) => entry.id === state.selectedEntryId)?.id || state.entries[0]?.id || null;
+  state.view = "all";
+  state.sourceFilter = "";
+  render();
+  toast("已撤销");
+}
+
+async function handleAction(action, id, grade, turnId) {
   const entry = state.entries.find((item) => item.id === id);
   if (action === "new-fragment") return newFragment();
+  if (action === "focus-composer") {
+    state.view = "capture";
+    state.activeThreadId = null;
+    render();
+    elements.captureInput.focus();
+    return;
+  }
+  if (action === "focus-search") {
+    elements.searchBox.classList.add("is-open");
+    elements.search.focus();
+    return;
+  }
   if (action === "settings") return openSettings();
   if (action === "close-settings") return elements.dialog.close();
   if (action === "open-detail" && entry) return openEntryDetail(entry);
-  if (action === "close-detail") return elements.detailDialog.close();
+  if (action === "close-detail") {
+    state.selectedEntryId = null;
+    state.detailClosed = true;
+    state.detailOpened = false;
+    renderTimeline();
+    return;
+  }
   if (action === "new-provider") return newProvider();
   if (action === "delete-provider") return deleteProvider();
+  if (action === "rewind-thread" && entry) return rewindThread(entry, turnId);
   if (action === "toggle-key") {
     const showing = elements.apiKey.type === "text";
     elements.apiKey.type = showing ? "password" : "text";
@@ -732,11 +938,12 @@ async function handleAction(action, id, grade) {
     return;
   }
   if (action === "clear-search") { state.query = ""; elements.search.value = ""; elements.searchBox.classList.remove("has-value"); return renderTimeline(); }
+  if (action === "import") { elements.importJson.click(); return; }
   if (action === "load-more") { state.visibleLimit += 80; return renderTimeline(); }
   if (action === "reveal-review") { state.reviewReveal = true; return renderTimeline(); }
   if (action === "start-review" && entry) {
-    if (elements.detailDialog.open) elements.detailDialog.close();
     state.view = "review";
+    elements.timeline.scrollTop = 0;
     state.reviewFocusId = entry.id;
     state.reviewSessionTotal = dueEntries().length;
     state.reviewReveal = false;
@@ -753,14 +960,14 @@ async function handleAction(action, id, grade) {
     return render();
   }
   if (action === "continue" && entry) {
-    if (elements.detailDialog.open) elements.detailDialog.close();
     state.activeThreadId = entry.id;
-    state.expanded.add(entry.id);
+    state.selectedEntryId = entry.id;
+    state.detailClosed = false;
+    state.detailOpened = true;
     render(); elements.input.focus(); return;
   }
   if ((action === "toggle-thread" || action === "toggle-details") && entry) {
-    state.expanded.has(entry.id) ? state.expanded.delete(entry.id) : state.expanded.add(entry.id);
-    return renderTimeline();
+    return openEntryDetail(entry);
   }
   if (action === "star" && entry) {
     const result = await requestJson(`/api/entries/${entry.id}`, {
@@ -769,9 +976,11 @@ async function handleAction(action, id, grade) {
     state.entries[state.entries.indexOf(entry)] = result.entry;
   }
   if (action === "delete" && entry && confirm(`删除“${entry.displayText || entry.raw}”？`)) {
+    const snapshot = structuredClone(state.entries);
     await requestJson(`/api/entries/${entry.id}`, { method: "DELETE" });
     state.entries = state.entries.filter((item) => item.id !== entry.id);
     if (state.activeThreadId === entry.id) state.activeThreadId = null;
+    toast("片段已删除", { label: "撤销", run: () => restoreEntries(snapshot) });
   }
   if (action === "export") {
     const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), entries: state.entries }, null, 2)], { type: "application/json" });
@@ -779,10 +988,12 @@ async function handleAction(action, id, grade) {
     link.click(); URL.revokeObjectURL(link.href); toast("已导出 JSON"); return;
   }
   if (action === "reset" && confirm("恢复演示数据会替换本机片段库里的所有内容，继续吗？")) {
+    const snapshot = structuredClone(state.entries);
     const result = await requestJson("/api/entries", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entries: seedEntries }),
     });
-    state.entries = result.entries; state.activeThreadId = null; state.expanded.clear(); state.view = "all"; state.sourceFilter = ""; elements.dialog.close();
+    state.entries = result.entries; state.activeThreadId = null; state.selectedEntryId = state.entries[0]?.id || null; state.view = "all"; state.sourceFilter = ""; elements.dialog.close();
+    toast("已恢复演示数据", { label: "撤销", run: () => restoreEntries(snapshot) });
   }
   render();
 }
@@ -807,24 +1018,50 @@ async function changeEntrySource(select) {
   }
 }
 
+async function importLibraryFile(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (!file) return;
+  try {
+    const parsed = JSON.parse(await file.text());
+    const entries = Array.isArray(parsed) ? parsed : parsed?.entries;
+    if (!Array.isArray(entries)) throw new Error("JSON 中没有 entries 数组");
+    const result = await requestJson("/api/entries", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries }),
+    });
+    state.entries = result.entries || [];
+    state.selectedEntryId = state.entries[0]?.id || null;
+    state.view = "all";
+    state.sourceFilter = "";
+    elements.dialog.close();
+    render();
+    toast(`已导入 ${state.entries.length} 条片段`);
+  } catch (error) {
+    toast(error.message || "导入失败");
+  }
+}
+
 document.addEventListener("click", (event) => {
   const actionTarget = event.target.closest("[data-action]");
   if (actionTarget) {
-    handleAction(actionTarget.dataset.action, actionTarget.dataset.id, actionTarget.dataset.grade).catch((error) => toast(error.message || "操作失败"));
+    handleAction(actionTarget.dataset.action, actionTarget.dataset.id, actionTarget.dataset.grade, actionTarget.dataset.turnId).catch((error) => toast(error.message || "操作失败"));
     return;
   }
   const viewTarget = event.target.closest("[data-view]");
   if (viewTarget) {
     state.view = viewTarget.dataset.view;
+    state.detailClosed = false;
+    state.detailOpened = false;
     state.sourceFilter = "";
     state.visibleLimit = 80;
     state.reviewReveal = false;
     state.reviewFocusId = null;
     state.reviewSessionTotal = state.view === "review" ? dueEntries().length : 0;
+    elements.timeline.scrollTop = 0;
     render(); return;
   }
-  const sourceTarget = event.target.closest("[data-source-filter]");
-  if (sourceTarget) { state.view = "all"; state.visibleLimit = 80; state.sourceFilter = state.sourceFilter === sourceTarget.dataset.sourceFilter ? "" : sourceTarget.dataset.sourceFilter; render(); }
 });
 
 document.addEventListener("dblclick", (event) => {
@@ -839,10 +1076,39 @@ document.addEventListener("change", (event) => {
   if (sourceSelect) changeEntrySource(sourceSelect);
 });
 
+elements.filterSelect.addEventListener("change", () => {
+  const value = elements.filterSelect.value;
+  state.detailClosed = false;
+  state.detailOpened = false;
+  state.visibleLimit = 80;
+  if (value === "starred") {
+    state.view = "starred";
+    state.sourceFilter = "";
+  } else {
+    state.view = "all";
+    state.sourceFilter = value.startsWith("source:") ? value.slice(7) : "";
+  }
+  render();
+});
+
 elements.composer.addEventListener("submit", submitFragment);
+elements.send.addEventListener("click", (event) => {
+  if (!state.activeRequest) return;
+  event.preventDefault();
+  stopRequest();
+});
+elements.captureComposer.addEventListener("submit", submitFragment);
+elements.captureSend.addEventListener("click", (event) => {
+  if (!state.activeRequest) return;
+  event.preventDefault();
+  stopRequest();
+});
 elements.configForm.addEventListener("submit", saveAiConfig);
+elements.importJson.addEventListener("change", importLibraryFile);
 elements.refreshModels.addEventListener("click", refreshModelList);
 elements.providerSelect.addEventListener("change", () => activateProvider().catch((error) => toast(error.message || "切换失败")));
+elements.quickModelSelect.addEventListener("change", () => activateProvider(elements.quickModelSelect.value, false).catch((error) => toast(error.message || "切换失败")));
+elements.captureQuickModelSelect.addEventListener("change", () => activateProvider(elements.captureQuickModelSelect.value, false).catch((error) => toast(error.message || "切换失败")));
 document.querySelectorAll('input[name="api-style"]').forEach((input) => input.addEventListener("change", updateApiStyleHelp));
 document.querySelectorAll('input[name="theme"]').forEach((input) => input.addEventListener("change", () => {
   appearance.theme = input.value;
@@ -853,22 +1119,49 @@ elements.fontScale.addEventListener("input", () => {
   elements.fontScaleValue.value = `${appearance.fontScale}%`;
   applyAppearance();
 });
+elements.sendShortcut.addEventListener("change", () => {
+  appearance.sendShortcut = elements.sendShortcut.value;
+  applyAppearance();
+  renderComposer();
+  renderCapturePage();
+  refreshIcons();
+});
 elements.allowNoKey.addEventListener("change", () => {
   elements.apiKey.disabled = elements.allowNoKey.checked;
   if (elements.allowNoKey.checked) elements.apiKey.value = "";
 });
 elements.input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); elements.composer.requestSubmit(); }
+  if (event.key !== "Enter" || event.isComposing || state.activeRequest) return;
+  const sends = appearance.sendShortcut === "mod-enter"
+    ? (event.metaKey || event.ctrlKey) && !event.shiftKey
+    : appearance.sendShortcut === "shift-enter"
+      ? event.shiftKey && !event.metaKey && !event.ctrlKey
+      : !event.shiftKey && !event.metaKey && !event.ctrlKey;
+  if (sends) { event.preventDefault(); elements.composer.requestSubmit(); }
+});
+elements.captureInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.isComposing || state.activeRequest) return;
+  const sends = appearance.sendShortcut === "mod-enter"
+    ? (event.metaKey || event.ctrlKey) && !event.shiftKey
+    : appearance.sendShortcut === "shift-enter"
+      ? event.shiftKey && !event.metaKey && !event.ctrlKey
+      : !event.shiftKey && !event.metaKey && !event.ctrlKey;
+  if (sends) { event.preventDefault(); elements.captureComposer.requestSubmit(); }
 });
 elements.input.addEventListener("input", () => {
   elements.input.style.height = "auto";
   elements.input.style.height = `${Math.min(elements.input.scrollHeight, 150)}px`;
 });
+elements.captureInput.addEventListener("input", () => {
+  elements.captureInput.style.height = "auto";
+  elements.captureInput.style.height = `${Math.min(elements.captureInput.scrollHeight, 180)}px`;
+});
 elements.search.addEventListener("input", () => {
   state.query = elements.search.value;
   state.visibleLimit = 80;
   elements.searchBox.classList.toggle("has-value", Boolean(state.query));
-  renderTimeline();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => renderTimeline(), 150);
 });
 document.addEventListener("keydown", (event) => {
   if (state.view !== "review" || elements.dialog.open || ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
@@ -881,14 +1174,10 @@ document.addEventListener("keydown", (event) => {
 elements.dialog.addEventListener("click", (event) => {
   if (event.target === elements.dialog) elements.dialog.close();
 });
-elements.detailDialog.addEventListener("click", (event) => {
-  if (event.target === elements.detailDialog) elements.detailDialog.close();
-});
-
 render();
 getAiStatus();
 load().catch((error) => toast(error.message || "无法读取本地数据")).finally(() => {
   state.busy = false;
   render();
 });
-if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=8").catch(() => {});
+if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=18").catch(() => {});

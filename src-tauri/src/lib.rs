@@ -2,38 +2,19 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Mutex as StdMutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use url::Url;
 use uuid::Uuid;
 
 const DAY_MS: f64 = 86_400_000.0;
-const SYSTEM_PROMPT: &str = r#"You explain short language fragments for a Chinese-speaking learner.
-The input can be a word, phrase, full sentence, dialogue line, sign, message, or excerpt in any language.
-Prioritize the meaning in the supplied fragment itself. Do not dump unrelated dictionary senses.
-Be concise, natural, and honest about ambiguity. Correct obvious typos only when confident.
-
-For mode "new", first classify the input as word, word_list, phrase, sentence, or other. Return only valid JSON with these keys:
-{"type":"entry","kind":"word","displayText":"","correction":"","pronunciation":"/IPA/","meaning":"","context":"","words":[{"text":"","pronunciation":"/IPA/","meaning":""}],"usage":[""],"chunks":[{"text":"","meaning":""}],"memoryCue":""}
-- kind "word": exactly one standalone lexical word. pronunciation is required IPA; words contains exactly that word with IPA and its concise Chinese meaning.
-- kind "word_list": multiple standalone words rather than a phrase or sentence. words contains every word separately and pronunciation is required IPA for every item. Top-level pronunciation may be empty.
-- kind "phrase" or "sentence": words must be []; pronunciation may be empty.
-- Distinguish a meaningful multi-word phrase from a list of unrelated vocabulary. Commas/newlines often signal a word_list, but use linguistic meaning as the final test.
-- meaning: one natural Chinese understanding, not a long essay.
-- context: why this reading fits, or what context is missing.
-- usage: at most 3 concise nuances or examples.
-- chunks: at most 4 useful phrase chunks; use [] when not useful.
-- correction and pronunciation may be empty strings.
-
-For mode "followup", answer only within the supplied root fragment and local thread. Return only:
-{"type":"followup","answer":"","summary":""}
-- answer: direct Chinese answer to the latest question.
-- summary: a compact updated conclusion for later review.
-Never refer to fragments outside the payload."#;
+const SYSTEM_PROMPT: &str = include_str!("../../system-prompt.txt");
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +24,8 @@ struct ApiRequest {
     method: String,
     #[serde(default)]
     body: Value,
+    #[serde(default)]
+    request_id: String,
 }
 
 fn default_method() -> String {
@@ -79,10 +62,14 @@ struct Backend {
     library_path: PathBuf,
     saved_config: Value,
     library: Value,
+    library_serialized: String,
     client: reqwest::Client,
 }
 
-struct AppState(Mutex<Backend>);
+struct AppState {
+    backend: Mutex<Backend>,
+    cancellations: StdMutex<HashMap<String, watch::Sender<bool>>>,
+}
 
 fn now_ms() -> f64 {
     SystemTime::now()
@@ -177,14 +164,60 @@ fn clean_review(value: Option<&Value>, created_at: f64, status: &str) -> Value {
         created_at
     };
     let grade = text(review.and_then(|v| v.get("lastGrade")), 12);
+    let lapses = integer(review.and_then(|v| v.get("lapses")), 0);
     json!({
         "dueAt": number(review.and_then(|v| v.get("dueAt")), default_due),
         "intervalDays": number(review.and_then(|v| v.get("intervalDays")), 0.0).max(0.0),
         "ease": number(review.and_then(|v| v.get("ease")), 2.5).clamp(1.3, 3.2),
         "repetitions": integer(review.and_then(|v| v.get("repetitions")), 0),
-        "lapses": integer(review.and_then(|v| v.get("lapses")), 0),
+        "lapses": lapses,
+        "leech": boolean(review.and_then(|v| v.get("leech")), false) || lapses >= 8,
         "lastReviewedAt": number(review.and_then(|v| v.get("lastReviewedAt")), 0.0).max(0.0),
         "lastGrade": if ["again", "hard", "good", "easy"].contains(&grade.as_str()) { grade } else { String::new() }
+    })
+}
+
+fn lexical_token(value: &str) -> &str {
+    value.trim_matches(|char: char| !char.is_alphanumeric() && !matches!(char, '\'' | '’'))
+}
+
+fn migrate_legacy_correction(
+    raw: &str,
+    display_text: &str,
+    correction: &str,
+) -> Option<(String, String)> {
+    if correction.is_empty()
+        || display_text.to_lowercase() != raw.to_lowercase()
+        || correction.contains('→')
+        || correction.contains("->")
+    {
+        return None;
+    }
+    let original = raw.split_whitespace().collect::<Vec<_>>();
+    let corrected = correction.split_whitespace().collect::<Vec<_>>();
+    if original.len() < 2 || original.len() != corrected.len() {
+        return None;
+    }
+    let differences = original
+        .iter()
+        .zip(&corrected)
+        .enumerate()
+        .filter(|(_, (before, after))| {
+            lexical_token(before).to_lowercase() != lexical_token(after).to_lowercase()
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if differences.len() != 1 {
+        return None;
+    }
+    let index = differences[0];
+    let before = lexical_token(original[index]);
+    let after = lexical_token(corrected[index]);
+    (!before.is_empty() && !after.is_empty()).then(|| {
+        (
+            correction.to_string(),
+            format!("{} → {}", before.to_lowercase(), after.to_lowercase()),
+        )
     })
 }
 
@@ -242,18 +275,25 @@ fn clean_entry(value: &Value) -> Option<Value> {
                 "id": valid_id(turn.get("id")),
                 "question": question,
                 "answer": answer,
+                "summary": text(turn.get("summary"), 2_000),
                 "createdAt": number(turn.get("createdAt"), created_at)
             }))
         })
         .collect::<Vec<_>>();
     let display_text = text(object.get("displayText"), 5_000);
-    let display_text = if display_text.is_empty() {
+    let mut display_text = if display_text.is_empty() {
         raw.clone()
     } else {
         display_text
     };
-    let kind = infer_kind(&raw, &text(object.get("kind"), 24));
-    let pronunciation = text(object.get("pronunciation"), 500);
+    let mut correction = text(object.get("correction"), 500);
+    let mut pronunciation = text(object.get("pronunciation"), 500);
+    if let Some((corrected, label)) = migrate_legacy_correction(&raw, &display_text, &correction) {
+        display_text = corrected;
+        correction = label;
+        pronunciation.clear();
+    }
+    let kind = infer_kind(&display_text, &text(object.get("kind"), 24));
     let meaning = text(object.get("meaning"), 5_000);
     let mut words = object
         .get("words")
@@ -278,7 +318,7 @@ fn clean_entry(value: &Value) -> Option<Value> {
     if kind == "word" && words.is_empty() {
         words.push(json!({"text":display_text.clone(),"pronunciation":pronunciation.clone(),"meaning":meaning.clone()}));
     } else if kind == "word_list" && words.is_empty() {
-        words = word_parts(&raw)
+        words = word_parts(&display_text)
             .into_iter()
             .map(|word| json!({"text":word,"pronunciation":"","meaning":""}))
             .collect();
@@ -298,7 +338,7 @@ fn clean_entry(value: &Value) -> Option<Value> {
         "kind": kind,
         "words": words,
         "displayText": display_text,
-        "correction": text(object.get("correction"), 500),
+        "correction": correction,
         "pronunciation": pronunciation,
         "meaning": meaning,
         "context": text(object.get("context"), 5_000),
@@ -309,6 +349,7 @@ fn clean_entry(value: &Value) -> Option<Value> {
         "starred": boolean(object.get("starred"), false),
         "createdAt": created_at,
         "updatedAt": number(object.get("updatedAt"), created_at),
+        "baseConclusion": text(object.get("baseConclusion").or_else(|| object.get("meaning")).or_else(|| object.get("conclusion")), 2_000),
         "conclusion": text(object.get("conclusion"), 2_000),
         "review": clean_review(object.get("review"), created_at, status),
         "thread": thread
@@ -338,10 +379,6 @@ fn write_private_json(path: &Path, value: &Value) -> Result<(), String> {
     let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
     let data = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     fs::write(&temporary, data).map_err(|error| format!("无法写入本地数据：{error}"))?;
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| error.to_string())?;
-    }
     fs::rename(&temporary, path).map_err(|error| format!("无法保存本地数据：{error}"))?;
     #[cfg(unix)]
     {
@@ -435,11 +472,14 @@ impl Backend {
         if library_path.exists() {
             write_private_json(&library_path, &library)?;
         }
+        let library_serialized =
+            serde_json::to_string(&library).map_err(|error| error.to_string())?;
         Ok(Self {
             settings_path,
             library_path,
             saved_config,
             library,
+            library_serialized,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
@@ -473,14 +513,23 @@ impl Backend {
         };
         let base_url =
             normalize_base(&text(pick("baseUrl"), 2_000).if_empty("https://api.openai.com/v1"))?;
+        let provider_base_url = provider
+            .and_then(|item| item.get("baseUrl"))
+            .map(|value| normalize_base(&text(Some(value), 2_000)))
+            .transpose()?;
+        let base_matches_provider = provider_base_url.as_deref().map_or(true, |saved| {
+            !override_map.is_some_and(|map| map.contains_key("baseUrl")) || saved == base_url
+        });
         let allow_no_key = boolean(pick("allowNoKey"), false);
         let supplied_key = text(override_map.and_then(|map| map.get("apiKey")), 10_000);
         let api_key = if !supplied_key.is_empty() {
             supplied_key
         } else if override_map.is_some() && allow_no_key {
             String::new()
-        } else {
+        } else if base_matches_provider {
             text(provider.and_then(|item| item.get("apiKey")), 10_000)
+        } else {
+            String::new()
         };
         let api_style = if text(pick("apiStyle"), 32) == "compatible" {
             "compatible".into()
@@ -592,8 +641,27 @@ impl Backend {
             .as_array_mut()
             .expect("entries array")
     }
-    fn save_library(&self) -> Result<(), String> {
-        write_private_json(&self.library_path, &self.library)
+    fn duplicate_entry(&self, fragment: &str) -> Option<Value> {
+        let normalized = fragment.trim().to_lowercase();
+        self.entries()
+            .iter()
+            .find(|entry| {
+                [entry.get("raw"), entry.get("displayText")]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|value| value.trim().to_lowercase() == normalized)
+            })
+            .cloned()
+    }
+    fn save_library(&mut self) -> Result<(), String> {
+        let serialized = serde_json::to_string(&self.library).map_err(|error| error.to_string())?;
+        if serialized == self.library_serialized {
+            return Ok(());
+        }
+        write_private_json(&self.library_path, &self.library)?;
+        self.library_serialized = serialized;
+        Ok(())
     }
 
     async fn fetch_json(
@@ -603,33 +671,7 @@ impl Backend {
         config: &AiConfig,
         body: Option<Value>,
     ) -> Result<Value, String> {
-        let mut request = self
-            .client
-            .request(method, url)
-            .header("Content-Type", "application/json");
-        if !config.api_key.is_empty() {
-            request = request.bearer_auth(&config.api_key);
-        }
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| format!("无法连接 AI 服务：{error}"))?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-        let value: Value = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)}));
-        if !status.is_success() {
-            return Err(value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .or_else(|| value.get("message").and_then(Value::as_str))
-                .unwrap_or("上游请求失败")
-                .to_string());
-        }
-        Ok(value)
+        fetch_json_with_client(&self.client, method, url, config, body).await
     }
 
     async fn list_models(&self, body: &Value) -> Result<Value, String> {
@@ -667,31 +709,16 @@ impl Backend {
         Ok(json!({"models": models}))
     }
 
-    async fn explain(&self, payload: &Value, config: &AiConfig) -> Result<Value, String> {
-        if !config.configured() {
-            return Ok(demo_explain(payload));
-        }
-        let input = serde_json::to_string(payload).map_err(|error| error.to_string())?;
-        let value = if config.api_style == "responses" {
-            self.fetch_json(
-                Method::POST,
-                format!("{}/responses", config.base_url),
-                config,
-                Some(json!({"model": config.model, "instructions": SYSTEM_PROMPT, "input": input})),
-            )
-            .await?
-        } else {
-            self.fetch_json(Method::POST, format!("{}/chat/completions", config.base_url), config, Some(json!({"model": config.model, "messages": [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":input}]}))).await?
-        };
-        let output = if config.api_style == "responses" {
-            response_text(&value)
-        } else {
-            content_text(value.pointer("/choices/0/message/content"))
-        };
-        parse_model_json(&output)
+    async fn explain_cancellable(
+        &self,
+        payload: &Value,
+        config: &AiConfig,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> Result<Value, String> {
+        explain_cancellable_with_client(&self.client, payload, config, cancellation).await
     }
 
-    async fn create_entry(&mut self, body: &Value) -> Result<Value, String> {
+    fn prepare_new_entry(&self, body: &Value) -> Result<(String, String, Value, AiConfig), String> {
         let fragment = text(body.get("text"), 5_000);
         if fragment.is_empty() {
             return Err("请输入一个语言片段".into());
@@ -699,7 +726,16 @@ impl Backend {
         let source = text(body.get("source"), 24);
         let payload = json!({"mode":"new","text":fragment,"source":source,"kindHint":infer_kind(&fragment, "")});
         let config = self.resolve_config(None)?;
-        let result = self.explain(&payload, &config).await?;
+        Ok((fragment, source, payload, config))
+    }
+
+    fn commit_new_entry(
+        &mut self,
+        fragment: String,
+        source: String,
+        result: Value,
+        config: &AiConfig,
+    ) -> Result<Value, String> {
         let created = now_ms();
         let entry = clean_entry(&json!({
             "id": Uuid::new_v4().to_string(), "raw": fragment,
@@ -709,6 +745,7 @@ impl Backend {
             "meaning": text(result.get("meaning"), 5_000), "context": text(result.get("context"), 5_000),
             "usage": result.get("usage").cloned().unwrap_or(json!([])), "chunks": result.get("chunks").cloned().unwrap_or(json!([])),
             "source": source, "status":"review", "starred":false, "createdAt":created, "updatedAt":created,
+            "baseConclusion": text(result.get("memoryCue").or_else(|| result.get("meaning")), 2_000),
             "conclusion": text(result.get("memoryCue").or_else(|| result.get("meaning")), 2_000),
             "review":{"dueAt":created + 600_000.0}, "thread":[]
         })).ok_or("无法创建片段")?;
@@ -717,22 +754,39 @@ impl Backend {
         Ok(json!({"entry": entry, "demo": !config.configured()}))
     }
 
-    async fn add_followup(&mut self, id: &str, body: &Value) -> Result<Value, String> {
-        let index = self
+    fn prepare_followup(
+        &self,
+        id: &str,
+        body: &Value,
+    ) -> Result<(String, Value, AiConfig), String> {
+        let entry = self
             .entries()
             .iter()
-            .position(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
             .ok_or("没有找到这个片段")?;
-        let entry = self.entries()[index].clone();
         let question = text(body.get("text"), 1_000);
         if question.is_empty() {
             return Err("请输入追问内容".into());
         }
-        let payload = json!({"mode":"followup","text":question,"root":entry["raw"],"conclusion":entry["conclusion"],"recentTurns":entry["thread"]});
+        let root = text(entry.get("displayText").or_else(|| entry.get("raw")), 5_000);
+        let payload = json!({"mode":"followup","text":question,"root":root,"conclusion":entry["conclusion"],"recentTurns":entry["thread"]});
         let config = self.resolve_config(None)?;
-        let result = self.explain(&payload, &config).await?;
-        let current = &mut self.entries_mut()[index];
-        current["thread"].as_array_mut().expect("thread array").push(json!({"id":Uuid::new_v4().to_string(),"question":question,"answer":text(result.get("answer"),2_000),"createdAt":now_ms()}));
+        Ok((question, payload, config))
+    }
+
+    fn commit_followup(
+        &mut self,
+        id: &str,
+        question: String,
+        result: Value,
+        config: &AiConfig,
+    ) -> Result<Value, String> {
+        let current = self
+            .entries_mut()
+            .iter_mut()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or("没有找到这个片段")?;
+        current["thread"].as_array_mut().expect("thread array").push(json!({"id":Uuid::new_v4().to_string(),"question":question,"answer":text(result.get("answer"),2_000),"summary":text(result.get("summary"),2_000),"createdAt":now_ms()}));
         if let Some(summary) = result
             .get("summary")
             .and_then(Value::as_str)
@@ -744,6 +798,76 @@ impl Backend {
         let updated = current.clone();
         self.save_library()?;
         Ok(json!({"entry":updated,"demo":!config.configured()}))
+    }
+
+    async fn create_entry(
+        &mut self,
+        body: &Value,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> Result<Value, String> {
+        let (fragment, source, payload, config) = self.prepare_new_entry(body)?;
+        if let Some(entry) = self.duplicate_entry(&fragment) {
+            return Ok(json!({"entry":entry,"duplicate":true,"demo":false}));
+        }
+        let result = self
+            .explain_cancellable(&payload, &config, cancellation)
+            .await?;
+        self.commit_new_entry(fragment, source, result, &config)
+    }
+
+    async fn add_followup(
+        &mut self,
+        id: &str,
+        body: &Value,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> Result<Value, String> {
+        let (question, payload, config) = self.prepare_followup(id, body)?;
+        let result = self
+            .explain_cancellable(&payload, &config, cancellation)
+            .await?;
+        self.commit_followup(id, question, result, &config)
+    }
+
+    fn rewind_followups(&mut self, id: &str, body: &Value) -> Result<Value, String> {
+        let entry = self
+            .entries_mut()
+            .iter_mut()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or("没有找到这个片段")?;
+        let turn_id = text(body.get("turnId"), 80);
+        let index = if turn_id.is_empty() {
+            None
+        } else {
+            Some(
+                entry["thread"]
+                    .as_array()
+                    .and_then(|turns| {
+                        turns.iter().position(|turn| {
+                            turn.get("id").and_then(Value::as_str) == Some(&turn_id)
+                        })
+                    })
+                    .ok_or("没有找到这一轮追问")?,
+            )
+        };
+        let turns = entry["thread"].as_array_mut().expect("thread array");
+        turns.truncate(index.map_or(0, |value| value + 1));
+        let conclusion = turns
+            .last()
+            .and_then(|turn| turn.get("summary"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                text(
+                    entry.get("baseConclusion").or_else(|| entry.get("meaning")),
+                    2_000,
+                )
+            });
+        entry["conclusion"] = json!(conclusion);
+        entry["updatedAt"] = json!(now_ms());
+        let updated = entry.clone();
+        self.save_library()?;
+        Ok(json!({"entry":updated}))
     }
 
     fn update_entry(&mut self, id: &str, body: &Value) -> Result<Value, String> {
@@ -787,7 +911,11 @@ impl Backend {
             .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
             .ok_or("没有找到这个片段")?;
         entry["review"] = schedule_review(&entry["review"], &grade);
-        entry["status"] = json!("learned");
+        entry["status"] = json!(if grade == "again" {
+            "review"
+        } else {
+            "learned"
+        });
         entry["updatedAt"] = json!(now_ms());
         let updated = entry.clone();
         self.save_library()?;
@@ -819,7 +947,11 @@ impl Backend {
         Ok(self.library.clone())
     }
 
-    async fn handle(&mut self, request: ApiRequest) -> Result<(u16, Value), String> {
+    async fn handle(
+        &mut self,
+        request: ApiRequest,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> Result<(u16, Value), String> {
         let method = request.method.to_uppercase();
         let path = request.url.split('?').next().unwrap_or("");
         if matches!(path, "/api/config" | "/api/status") && method == "GET" {
@@ -838,7 +970,7 @@ impl Backend {
             return Ok((200, self.replace_entries(&request.body)?));
         }
         if path == "/api/entries" && method == "POST" {
-            return Ok((201, self.create_entry(&request.body).await?));
+            return Ok((201, self.create_entry(&request.body, cancellation).await?));
         }
         let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
         if parts.len() == 4
@@ -856,7 +988,18 @@ impl Backend {
             && parts[3] == "followups"
             && method == "POST"
         {
-            return Ok((201, self.add_followup(parts[2], &request.body).await?));
+            return Ok((
+                201,
+                self.add_followup(parts[2], &request.body, cancellation)
+                    .await?,
+            ));
+        }
+        if parts.len() == 4
+            && parts[..2] == ["api", "entries"]
+            && parts[3] == "followups"
+            && method == "PATCH"
+        {
+            return Ok((200, self.rewind_followups(parts[2], &request.body)?));
         }
         if parts.len() == 4
             && parts[..2] == ["api", "entries"]
@@ -872,6 +1015,207 @@ impl Backend {
             return Ok((200, self.delete_entry(parts[2])?));
         }
         Err("不支持的本地 API".into())
+    }
+}
+
+async fn fetch_json_with_client(
+    client: &reqwest::Client,
+    method: Method,
+    url: String,
+    config: &AiConfig,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    for attempt in 0..3 {
+        let mut request = client
+            .request(method.clone(), url.clone())
+            .header("Content-Type", "application/json");
+        if !config.api_key.is_empty() {
+            request = request.bearer_auth(&config.api_key);
+        }
+        if let Some(body) = body.clone() {
+            request = request.json(&body);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_error) if attempt < 2 => {
+                tokio::time::sleep(std::time::Duration::from_millis(250 * 2_u64.pow(attempt)))
+                    .await;
+                continue;
+            }
+            Err(error) => return Err(format!("无法连接 AI 服务：{error}")),
+        };
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+        let value: Value = if content_type.contains("text/event-stream") {
+            parse_sse(&String::from_utf8_lossy(&bytes))
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)}))
+        };
+        if !status.is_success() {
+            if matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504) && attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(250 * 2_u64.pow(attempt)))
+                    .await;
+                continue;
+            }
+            return Err(format!(
+                "上游请求失败 ({})：{}",
+                status.as_u16(),
+                value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("message").and_then(Value::as_str))
+                    .unwrap_or("上游请求失败")
+            ));
+        }
+        return Ok(value);
+    }
+    Err("上游请求失败".into())
+}
+
+async fn explain_with_client(
+    client: &reqwest::Client,
+    payload: &Value,
+    config: &AiConfig,
+) -> Result<Value, String> {
+    if !config.configured() {
+        return Ok(demo_explain(payload));
+    }
+    let input = serde_json::to_string(payload).map_err(|error| error.to_string())?;
+    let schema = response_schema(payload);
+    let request = |structured: bool| {
+        let input = input.clone();
+        let schema = schema.clone();
+        async move {
+            if config.api_style == "responses" {
+                let mut body = json!({
+                        "model": config.model,
+                        "instructions": SYSTEM_PROMPT,
+                        "input": input,
+                    "max_output_tokens": 1200
+                });
+                if structured {
+                    body["stream"] = json!(true);
+                    body["text"] = json!({"format":{"type":"json_schema","name":schema["name"],"strict":true,"schema":schema["schema"]}});
+                }
+                fetch_json_with_client(
+                    client,
+                    Method::POST,
+                    format!("{}/responses", config.base_url),
+                    config,
+                    Some(body),
+                )
+                .await
+            } else {
+                let mut body = json!({
+                        "model": config.model,
+                        "temperature": 0.2,
+                        "max_tokens": 1200,
+                        "messages": [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":input}]
+                });
+                if structured {
+                    body["stream"] = json!(true);
+                    body["response_format"] = json!({"type":"json_schema","json_schema":{"name":schema["name"],"strict":true,"schema":schema["schema"]}});
+                }
+                fetch_json_with_client(
+                    client,
+                    Method::POST,
+                    format!("{}/chat/completions", config.base_url),
+                    config,
+                    Some(body),
+                )
+                .await
+            }
+        }
+    };
+    let value = match request(true).await {
+        Ok(value) => value,
+        Err(error) if error.contains("(400)") => request(false).await?,
+        Err(error) => return Err(error),
+    };
+    let output = if config.api_style == "responses" {
+        response_text(&value)
+    } else {
+        content_text(value.pointer("/choices/0/message/content"))
+    };
+    parse_model_json(&output)
+}
+
+fn response_schema(payload: &Value) -> Value {
+    if payload.get("mode").and_then(Value::as_str) == Some("followup") {
+        json!({
+            "name": "shici_followup",
+            "schema": {"type":"object","additionalProperties":false,"properties":{"type":{"type":"string"},"answer":{"type":"string"},"summary":{"type":"string"}},"required":["type","answer","summary"]}
+        })
+    } else {
+        json!({
+            "name": "shici_entry",
+            "schema": {"type":"object","additionalProperties":false,"properties":{
+                "type":{"type":"string"},"kind":{"type":"string","enum":["word","word_list","phrase","sentence","other"]},"displayText":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},
+                "words":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"}},"required":["text","pronunciation","meaning"]}},
+                "usage":{"type":"array","items":{"type":"string"}},"chunks":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"meaning":{"type":"string"}},"required":["text","meaning"]}},"memoryCue":{"type":"string"}
+            },"required":["type","kind","displayText","correction","pronunciation","meaning","context","words","usage","chunks","memoryCue"]}
+        })
+    }
+}
+
+fn parse_sse(raw: &str) -> Value {
+    let mut response_text = String::new();
+    let mut chat_text = String::new();
+    for line in raw.lines().filter(|line| line.starts_with("data:")) {
+        let chunk = line.trim_start_matches("data:").trim();
+        if chunk.is_empty() || chunk == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(chunk) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
+            response_text.push_str(event.get("delta").and_then(Value::as_str).unwrap_or(""));
+        }
+        chat_text.push_str(
+            event
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+            if let Some(response) = event.get("response") {
+                return response.clone();
+            }
+        }
+    }
+    if !response_text.is_empty() {
+        json!({"output_text":response_text})
+    } else {
+        json!({"choices":[{"message":{"content":chat_text}}]})
+    }
+}
+
+async fn explain_cancellable_with_client(
+    client: &reqwest::Client,
+    payload: &Value,
+    config: &AiConfig,
+    mut cancellation: Option<watch::Receiver<bool>>,
+) -> Result<Value, String> {
+    if cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return Err("请求已暂停".into());
+    }
+    match cancellation.as_mut() {
+        Some(receiver) => tokio::select! {
+            result = explain_with_client(client, payload, config) => result,
+            _ = receiver.changed() => Err("请求已暂停".into()),
+        },
+        None => explain_with_client(client, payload, config).await,
     }
 }
 
@@ -935,8 +1279,12 @@ fn schedule_review(review: &Value, grade: &str) -> Value {
             result
         }
     };
-    let interval = (interval * 100.0).round() / 100.0;
-    json!({"dueAt":now + interval * DAY_MS,"intervalDays":interval,"ease":(ease*100.0).round()/100.0,"repetitions":repetitions,"lapses":lapses,"lastReviewedAt":now,"lastGrade":grade})
+    let mut interval = interval;
+    if repetitions > 1 && grade != "again" {
+        interval *= 0.9 + ((now / 60_000.0) as u64 % 21) as f64 / 100.0;
+    }
+    interval = (interval * 100.0).round() / 100.0;
+    json!({"dueAt":now + interval * DAY_MS,"intervalDays":interval,"ease":(ease*100.0).round()/100.0,"repetitions":repetitions,"lapses":lapses,"leech":lapses >= 8,"lastReviewedAt":now,"lastGrade":grade})
 }
 
 fn content_text(value: Option<&Value>) -> String {
@@ -1007,19 +1355,127 @@ fn demo_explain(payload: &Value) -> Value {
     json!({"type":"entry","kind":kind,"displayText":fragment,"correction":"","pronunciation":"","words":words,"meaning":"演示模式不会猜测这个片段的具体含义。","context":"它已作为独立片段保存。配置 AI 后会生成语境化解释。","usage":[],"chunks":[],"memoryCue":"","demo":true})
 }
 
+fn error_status(message: &str) -> u16 {
+    if message == "请求已暂停" {
+        499
+    } else if message.contains("没有找到") {
+        404
+    } else if message.contains("请输入")
+        || message.contains("格式不正确")
+        || message.contains("Base URL")
+        || message.contains("请填写")
+        || message.contains("不支持")
+    {
+        400
+    } else {
+        502
+    }
+}
+
 #[tauri::command]
 async fn api_request(
     request: ApiRequest,
     state: State<'_, AppState>,
 ) -> Result<ApiResponse, String> {
-    let mut backend = state.0.lock().await;
-    Ok(match backend.handle(request).await {
+    let request_id = request.request_id.clone();
+    let cancellation = if request_id.is_empty() {
+        None
+    } else {
+        let already_cancelled = state
+            .cancellations
+            .lock()
+            .map_err(|_| "取消状态不可用")?
+            .remove(&request_id)
+            .is_some_and(|sender| *sender.borrow());
+        let (sender, receiver) = watch::channel(already_cancelled);
+        state
+            .cancellations
+            .lock()
+            .map_err(|_| "取消状态不可用")?
+            .insert(request_id.clone(), sender);
+        Some(receiver)
+    };
+    let method = request.method.to_uppercase();
+    let path = request.url.split('?').next().unwrap_or("").to_string();
+    let result = if path == "/api/entries" && method == "POST" {
+        let duplicate = {
+            let backend = state.backend.lock().await;
+            let fragment = text(request.body.get("text"), 5_000);
+            backend.duplicate_entry(&fragment)
+        };
+        if let Some(entry) = duplicate {
+            Ok((200, json!({"entry":entry,"duplicate":true,"demo":false})))
+        } else {
+            let (fragment, source, payload, config, client) = {
+                let backend = state.backend.lock().await;
+                let (fragment, source, payload, config) =
+                    backend.prepare_new_entry(&request.body)?;
+                (fragment, source, payload, config, backend.client.clone())
+            };
+            let generated =
+                explain_cancellable_with_client(&client, &payload, &config, cancellation).await;
+            let mut backend = state.backend.lock().await;
+            generated.and_then(|result| {
+                backend
+                    .commit_new_entry(fragment, source, result, &config)
+                    .map(|body| (201, body))
+            })
+        }
+    } else if method == "POST" && path.starts_with("/api/entries/") && path.ends_with("/followups")
+    {
+        let id = path
+            .trim_start_matches("/api/entries/")
+            .trim_end_matches("/followups")
+            .trim_end_matches('/')
+            .to_string();
+        let (question, payload, config, client) = {
+            let backend = state.backend.lock().await;
+            let (question, payload, config) = backend.prepare_followup(&id, &request.body)?;
+            (question, payload, config, backend.client.clone())
+        };
+        let generated =
+            explain_cancellable_with_client(&client, &payload, &config, cancellation).await;
+        let mut backend = state.backend.lock().await;
+        generated.and_then(|result| {
+            backend
+                .commit_followup(&id, question, result, &config)
+                .map(|body| (201, body))
+        })
+    } else {
+        let mut backend = state.backend.lock().await;
+        backend.handle(request, cancellation).await
+    };
+    if !request_id.is_empty() {
+        state
+            .cancellations
+            .lock()
+            .map_err(|_| "取消状态不可用")?
+            .remove(&request_id);
+    }
+    Ok(match result {
         Ok((status, body)) => ApiResponse { status, body },
         Err(message) => ApiResponse {
-            status: 502,
+            status: error_status(&message),
             body: json!({"error":message}),
         },
     })
+}
+
+#[tauri::command]
+fn cancel_request(request_id: String, state: State<'_, AppState>) -> bool {
+    let Ok(mut cancellations) = state.cancellations.lock() else {
+        return false;
+    };
+    if let Some(sender) = cancellations.get(&request_id) {
+        sender.send(true).is_ok()
+    } else {
+        if cancellations.len() >= 100 {
+            cancellations.retain(|_, sender| sender.receiver_count() > 0);
+        }
+        let (sender, _) = watch::channel(true);
+        cancellations.insert(request_id, sender);
+        true
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1028,10 +1484,13 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let backend = Backend::new(data_dir).map_err(std::io::Error::other)?;
-            app.manage(AppState(Mutex::new(backend)));
+            app.manage(AppState {
+                backend: Mutex::new(backend),
+                cancellations: StdMutex::new(HashMap::new()),
+            });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![api_request])
+        .invoke_handler(tauri::generate_handler![api_request, cancel_request])
         .run(tauri::generate_context!())
         .expect("error while running 拾词");
 }
@@ -1053,9 +1512,39 @@ mod tests {
 
     #[test]
     fn fragment_kinds_keep_words_separate_from_phrases() {
-        assert_eq!(infer_kind("suffocating", ""), "word");
-        assert_eq!(infer_kind("alpha, beta", ""), "word_list");
-        assert_eq!(infer_kind("figure it out", ""), "phrase");
-        assert_eq!(infer_kind("This is a complete sentence.", ""), "sentence");
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../../test/fixtures/fragment-cases.json")).unwrap();
+        for case in cases {
+            assert_eq!(
+                infer_kind(text(case.get("text"), 5_000).as_str(), ""),
+                text(case.get("kind"), 24)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_full_sentence_correction_is_promoted() {
+        let entry = clean_entry(&json!({
+            "raw":"her foodsteps hurried as she all but fled the room",
+            "displayText":"her foodsteps hurried as she all but fled the room",
+            "correction":"her footsteps hurried as she all but fled the room",
+            "pronunciation":"old sentence pronunciation",
+            "kind":"sentence"
+        }))
+        .unwrap();
+        assert_eq!(
+            entry["displayText"],
+            json!("her footsteps hurried as she all but fled the room")
+        );
+        assert_eq!(entry["correction"], json!("foodsteps → footsteps"));
+        assert_eq!(entry["pronunciation"], json!(""));
+    }
+
+    #[test]
+    fn sse_deltas_are_aggregated() {
+        let value = parse_sse(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\ndata: [DONE]\n",
+        );
+        assert_eq!(value["output_text"], json!("hello"));
     }
 }

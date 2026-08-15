@@ -3,25 +3,25 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#0d766e" />
+    <meta name="theme-color" content="#5db8df" />
     <meta name="description" content="拾词：捕捉并理解散落在任何场景里的语言片段。" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=8" />
+    <link rel="stylesheet" href="/styles.css?v=18" />
     <title>拾词</title>
   </head>
   <body>
     <div class="app-shell">
       <main class="workspace">
         <header class="topbar">
-          <div class="brand"><span class="brand-mark">拾</span><span>拾词</span></div>
+          <div class="brand"><span>拾词</span></div>
           <nav class="top-nav" aria-label="主导航">
+            <button type="button" data-action="focus-composer"><span>记录</span></button>
             <button class="active" type="button" data-view="all"><span>词库</span><small id="all-count">0</small></button>
             <button type="button" data-view="review"><span>复习</span><small id="review-count">0</small></button>
-            <button type="button" data-view="starred"><span>收藏</span><small id="star-count">0</small></button>
           </nav>
           <div class="topbar-actions">
-            <label class="search-box">
+            <label class="search-box" data-action="focus-search">
               <i data-lucide="search" aria-hidden="true"></i>
               <input id="search-input" type="search" placeholder="搜索片段、解释或来源" autocomplete="off" />
               <button class="icon-button search-clear" type="button" data-action="clear-search" aria-label="清除搜索">
@@ -34,58 +34,111 @@
           </div>
         </header>
 
-        <section class="composer-shell" aria-label="输入语言片段">
-          <div class="context-bar" id="context-bar" hidden>
-            <div class="context-copy">
-              <span class="pulse-dot"></span>
-              <span>正在追问</span>
-              <strong id="context-title"></strong>
-            </div>
-            <div class="context-actions">
-              <button type="button" class="text-button" data-action="new-fragment">新片段</button>
-              <button type="button" class="icon-button" data-action="new-fragment" aria-label="结束追问">
-                <i data-lucide="x" aria-hidden="true"></i>
+        <div class="workspace-body">
+          <section class="library-column">
+            <div class="capture-grid">
+              <section class="composer-shell" aria-label="输入语言片段">
+                <div class="context-bar" id="context-bar" hidden>
+                  <div class="context-copy">
+                    <span class="pulse-dot"></span>
+                    <span>正在追问</span>
+                    <strong id="context-title"></strong>
+                  </div>
+                  <div class="context-actions">
+                    <button type="button" class="text-button" data-action="new-fragment">新片段</button>
+                    <button type="button" class="icon-button" data-action="new-fragment" aria-label="结束追问">
+                      <i data-lucide="x" aria-hidden="true"></i>
+                    </button>
+                  </div>
+                </div>
+                <form class="composer" id="composer">
+                  <textarea id="fragment-input" rows="2" maxlength="5000" placeholder="记录一个不懂的词、短语或句子…"></textarea>
+                  <div class="composer-row">
+                    <label class="source-picker">
+                      <i data-lucide="tag" aria-hidden="true"></i>
+                      <select id="source-select" aria-label="片段来源">
+                        <option value="">不标记来源</option>
+                        <option value="日常">日常</option>
+                        <option value="阅读">阅读</option>
+                        <option value="影视">影视</option>
+                        <option value="工作">工作</option>
+                        <option value="游戏">游戏</option>
+                        <option value="网页">网页</option>
+                        <option value="聊天">聊天</option>
+                        <option value="其他">其他</option>
+                      </select>
+                    </label>
+                    <div class="composer-meta">
+                      <span class="ai-state" id="ai-state" role="status" aria-live="polite"><span class="status-dot"></span>检测中</span>
+                      <select class="quick-model-select" id="quick-model-select" aria-label="快速切换 AI Provider 与模型" hidden></select>
+                      <button class="send-button" id="send-button" type="submit">保存</button>
+                    </div>
+                  </div>
+                </form>
+              </section>
+
+              <button class="focus-card" type="button" data-view="review">
+                <span class="focus-title">今日复习<i data-lucide="brain" aria-hidden="true"></i></span>
+                <strong id="focus-count">0</strong>
+                <small id="focus-label">今日待复习</small>
+                <span class="focus-progress"><i id="focus-progress"></i></span>
               </button>
             </div>
-          </div>
-          <form class="composer" id="composer">
-            <textarea id="fragment-input" rows="2" maxlength="5000" placeholder="贴入一个不懂的词、短语或句子…"></textarea>
-            <div class="composer-row">
-              <label class="source-picker">
-                <i data-lucide="tag" aria-hidden="true"></i>
-                <select id="source-select" aria-label="片段来源">
-                  <option value="">不标记来源</option>
-                  <option value="日常">日常</option>
-                  <option value="阅读">阅读</option>
-                  <option value="影视">影视</option>
-                  <option value="工作">工作</option>
-                  <option value="游戏">游戏</option>
-                  <option value="网页">网页</option>
-                  <option value="聊天">聊天</option>
-                  <option value="其他">其他</option>
+
+            <section class="library-head" id="library-head">
+              <div>
+                <h1 id="view-title">词库</h1>
+                <p id="view-subtitle">散落在不同场景里的语言片段</p>
+              </div>
+              <label class="library-filter">
+                <span>筛选</span>
+                <select id="library-filter-select" aria-label="筛选词库">
+                  <option value="all">全部</option>
+                  <option value="starred">收藏</option>
                 </select>
               </label>
-              <div class="composer-meta">
-                <span class="ai-state" id="ai-state"><span></span>检测中</span>
-                <button class="send-button" id="send-button" type="submit" aria-label="发送">
-                  <i data-lucide="arrow-up" aria-hidden="true"></i>
-                </button>
-              </div>
+              <span id="star-count" hidden>0</span>
+            </section>
+
+            <section class="timeline" id="timeline"></section>
+          </section>
+
+          <section class="capture-page" id="capture-page" hidden aria-labelledby="capture-title">
+            <div class="capture-page-inner">
+              <span class="capture-kicker">新片段</span>
+              <h1 id="capture-title">记录语言片段</h1>
+              <form class="composer capture-composer" id="capture-composer">
+                <textarea id="capture-input" rows="3" maxlength="5000" placeholder="输入一个不懂的词、短语或句子…"></textarea>
+                <div class="composer-row">
+                  <label class="source-picker">
+                    <i data-lucide="tag" aria-hidden="true"></i>
+                    <select id="capture-source-select" aria-label="片段来源">
+                      <option value="">不标记来源</option>
+                      <option value="日常">日常</option>
+                      <option value="阅读">阅读</option>
+                      <option value="影视">影视</option>
+                      <option value="工作">工作</option>
+                      <option value="游戏">游戏</option>
+                      <option value="网页">网页</option>
+                      <option value="聊天">聊天</option>
+                      <option value="其他">其他</option>
+                    </select>
+                  </label>
+                  <div class="composer-meta">
+                    <span class="ai-state capture-ai-state" id="capture-ai-state" role="status" aria-live="polite"><span class="status-dot"></span>检测中</span>
+                    <select class="quick-model-select capture-quick-model-select" id="capture-quick-model-select" aria-label="快速切换 AI Provider 与模型" hidden></select>
+                    <button class="send-button" id="capture-send" type="submit">保存到词库</button>
+                  </div>
+                </div>
+              </form>
             </div>
-          </form>
-        </section>
+          </section>
 
-        <section class="library-head" id="library-head">
-          <div>
-            <h1 id="view-title">片段词库</h1>
-            <p id="view-subtitle">按需展开解释，快速扫描与整理</p>
-          </div>
-          <div class="source-summary" aria-label="按来源筛选">
-            <div id="source-filters"></div>
-          </div>
-        </section>
-
-        <section class="timeline" id="timeline" aria-live="polite"></section>
+          <aside class="detail-panel" id="detail-panel" aria-label="片段详情" hidden>
+            <div id="detail-content"></div>
+          </aside>
+          <button class="detail-backdrop" type="button" data-action="close-detail" aria-label="关闭详情" hidden></button>
+        </div>
 
         <nav class="bottom-nav" aria-label="移动端导航">
           <button class="active" type="button" data-view="all"><i data-lucide="library"></i><span>词库</span></button>
@@ -94,10 +147,6 @@
         </nav>
       </main>
     </div>
-
-    <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-title">
-      <div id="detail-content"></div>
-    </dialog>
 
     <dialog id="settings-dialog">
       <div class="dialog-header">
@@ -117,6 +166,14 @@
         <label class="setting-field font-setting">
           <span>字号 <output id="font-scale-value">100%</output></span>
           <input id="font-scale" type="range" min="90" max="120" step="5" value="100" />
+        </label>
+        <label class="setting-field">
+          <span>发送快捷键</span>
+          <select id="send-shortcut">
+            <option value="mod-enter">⌘ / Ctrl + Enter</option>
+            <option value="shift-enter">Shift + Enter</option>
+            <option value="enter">Enter</option>
+          </select>
         </label>
       </section>
       <form id="config-form" class="config-form">
@@ -176,12 +233,14 @@
       </div>
       <div class="dialog-actions">
         <button class="secondary-button" type="button" data-action="export"><i data-lucide="download"></i>导出 JSON</button>
+        <button class="secondary-button" type="button" data-action="import"><i data-lucide="upload"></i>导入 JSON</button>
+        <input id="import-json" type="file" accept="application/json,.json" hidden />
         <button class="secondary-button danger" type="button" data-action="reset"><i data-lucide="rotate-ccw"></i>恢复演示数据</button>
       </div>
     </dialog>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script src="/vendor/lucide.min.js?v=8"></script>
-    <script type="module" src="/app.js?v=8"></script>
+    <script src="/vendor/lucide.min.js?v=18"></script>
+    <script type="module" src="/app.js?v=18"></script>
   </body>
 </html>

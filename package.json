@@ -1,10 +1,11 @@
 {
   "name": "shici",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
+    "migrate": "node scripts/migrate-app-data.mjs",
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build",

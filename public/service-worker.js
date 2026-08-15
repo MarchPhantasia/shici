@@ -1,5 +1,5 @@
-const CACHE = "shici-v8";
-const FILES = ["/", "/styles.css?v=8", "/app.js?v=8", "/vendor/lucide.min.js?v=8", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "shici-v18";
+const FILES = ["/", "/styles.css?v=18", "/app.js?v=18", "/vendor/lucide.min.js?v=18", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -15,5 +15,5 @@ self.addEventListener("fetch", (event) => {
     const copy = response.clone();
     caches.open(CACHE).then((cache) => cache.put(event.request, copy));
     return response;
-  }).catch(() => caches.match(event.request)));
+  }).catch(() => caches.match(event.request, { ignoreSearch: true })));
 });
