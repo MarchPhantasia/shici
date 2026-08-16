@@ -7,7 +7,7 @@
     <meta name="description" content="拾词：捕捉并理解散落在任何场景里的语言片段。" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=18" />
+    <link rel="stylesheet" href="/styles.css?v=23" />
     <title>拾词</title>
   </head>
   <body>
@@ -54,23 +54,25 @@
                 <form class="composer" id="composer">
                   <textarea id="fragment-input" rows="2" maxlength="5000" placeholder="记录一个不懂的词、短语或句子…"></textarea>
                   <div class="composer-row">
-                    <label class="source-picker">
-                      <i data-lucide="tag" aria-hidden="true"></i>
-                      <select id="source-select" aria-label="片段来源">
-                        <option value="">不标记来源</option>
-                        <option value="日常">日常</option>
-                        <option value="阅读">阅读</option>
-                        <option value="影视">影视</option>
-                        <option value="工作">工作</option>
-                        <option value="游戏">游戏</option>
-                        <option value="网页">网页</option>
-                        <option value="聊天">聊天</option>
-                        <option value="其他">其他</option>
-                      </select>
-                    </label>
+                    <div class="composer-leading">
+                      <label class="source-picker">
+                        <i data-lucide="tag" aria-hidden="true"></i>
+                        <select id="source-select" aria-label="片段来源">
+                          <option value="">不标记来源</option>
+                          <option value="日常">日常</option>
+                          <option value="阅读">阅读</option>
+                          <option value="影视">影视</option>
+                          <option value="工作">工作</option>
+                          <option value="游戏">游戏</option>
+                          <option value="网页">网页</option>
+                          <option value="聊天">聊天</option>
+                          <option value="其他">其他</option>
+                        </select>
+                      </label>
+                      <select class="quick-model-select" id="quick-model-select" aria-label="快速切换 AI Provider 与模型" hidden></select>
+                    </div>
                     <div class="composer-meta">
                       <span class="ai-state" id="ai-state" role="status" aria-live="polite"><span class="status-dot"></span>检测中</span>
-                      <select class="quick-model-select" id="quick-model-select" aria-label="快速切换 AI Provider 与模型" hidden></select>
                       <button class="send-button" id="send-button" type="submit">保存</button>
                     </div>
                   </div>
@@ -110,23 +112,25 @@
               <form class="composer capture-composer" id="capture-composer">
                 <textarea id="capture-input" rows="3" maxlength="5000" placeholder="输入一个不懂的词、短语或句子…"></textarea>
                 <div class="composer-row">
-                  <label class="source-picker">
-                    <i data-lucide="tag" aria-hidden="true"></i>
-                    <select id="capture-source-select" aria-label="片段来源">
-                      <option value="">不标记来源</option>
-                      <option value="日常">日常</option>
-                      <option value="阅读">阅读</option>
-                      <option value="影视">影视</option>
-                      <option value="工作">工作</option>
-                      <option value="游戏">游戏</option>
-                      <option value="网页">网页</option>
-                      <option value="聊天">聊天</option>
-                      <option value="其他">其他</option>
-                    </select>
-                  </label>
+                  <div class="composer-leading">
+                    <label class="source-picker">
+                      <i data-lucide="tag" aria-hidden="true"></i>
+                      <select id="capture-source-select" aria-label="片段来源">
+                        <option value="">不标记来源</option>
+                        <option value="日常">日常</option>
+                        <option value="阅读">阅读</option>
+                        <option value="影视">影视</option>
+                        <option value="工作">工作</option>
+                        <option value="游戏">游戏</option>
+                        <option value="网页">网页</option>
+                        <option value="聊天">聊天</option>
+                        <option value="其他">其他</option>
+                      </select>
+                    </label>
+                    <select class="quick-model-select capture-quick-model-select" id="capture-quick-model-select" aria-label="快速切换 AI Provider 与模型" hidden></select>
+                  </div>
                   <div class="composer-meta">
                     <span class="ai-state capture-ai-state" id="capture-ai-state" role="status" aria-live="polite"><span class="status-dot"></span>检测中</span>
-                    <select class="quick-model-select capture-quick-model-select" id="capture-quick-model-select" aria-label="快速切换 AI Provider 与模型" hidden></select>
                     <button class="send-button" id="capture-send" type="submit">保存到词库</button>
                   </div>
                 </div>
@@ -198,6 +202,21 @@
             <p class="field-help" id="api-style-help">使用 /v1/responses。</p>
           </fieldset>
           <label class="setting-field">
+            <span>模型推理程度</span>
+            <select id="reasoning-effort">
+              <option value="auto">自动</option>
+              <option value="none">关闭思考</option>
+              <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
+            </select>
+            <small class="field-help">兼容接口会同时传递 reasoning_effort；Qwen/vLLM 会尝试关闭或启用 thinking。</small>
+          </label>
+          <label class="checkbox-row">
+            <input id="enable-thinking-toggle" type="checkbox" />
+            <span>此服务需要 chat_template_kwargs（vLLM / SGLang）</span>
+          </label>
+          <label class="setting-field">
             <span>Base URL</span>
             <input id="api-base-url" type="url" required placeholder="https://api.openai.com/v1" autocomplete="url" spellcheck="false" />
           </label>
@@ -239,8 +258,20 @@
       </div>
     </dialog>
 
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <form method="dialog" class="confirm-card">
+        <div class="dialog-header">
+          <div><h2 id="confirm-title">确认操作</h2><p id="confirm-message"></p></div>
+        </div>
+        <div class="dialog-actions">
+          <button class="secondary-button" value="cancel">取消</button>
+          <button class="primary-button danger" id="confirm-accept" value="confirm">确认</button>
+        </div>
+      </form>
+    </dialog>
+
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script src="/vendor/lucide.min.js?v=18"></script>
-    <script type="module" src="/app.js?v=18"></script>
+    <script src="/vendor/lucide.min.js?v=19"></script>
+    <script type="module" src="/app.js?v=19"></script>
   </body>
 </html>

@@ -146,12 +146,18 @@ const elements = {
   detailBackdrop: document.querySelector(".detail-backdrop"),
   detailContent: document.querySelector("#detail-content"),
   dialog: document.querySelector("#settings-dialog"),
+  confirmDialog: document.querySelector("#confirm-dialog"),
+  confirmTitle: document.querySelector("#confirm-title"),
+  confirmMessage: document.querySelector("#confirm-message"),
+  confirmAccept: document.querySelector("#confirm-accept"),
   toast: document.querySelector("#toast"),
   configForm: document.querySelector("#config-form"),
   apiBaseUrl: document.querySelector("#api-base-url"),
   providerSelect: document.querySelector("#provider-select"),
   providerName: document.querySelector("#provider-name"),
   deleteProvider: document.querySelector("#delete-provider"),
+  reasoningEffort: document.querySelector("#reasoning-effort"),
+  enableThinkingToggle: document.querySelector("#enable-thinking-toggle"),
   apiKey: document.querySelector("#api-key"),
   apiModel: document.querySelector("#api-model"),
   allowNoKey: document.querySelector("#allow-no-key"),
@@ -234,8 +240,111 @@ function icon(name) {
   return `<i data-lucide="${name}" aria-hidden="true"></i>`;
 }
 
+function customSelectKind(select) {
+  if (select.classList.contains("quick-model-select")) return "custom-select-model";
+  if (select.closest(".source-picker")) return "custom-select-source";
+  if (select.closest(".entry-source-picker")) return "custom-select-entry";
+  if (select.closest(".library-filter")) return "custom-select-filter";
+  if (select.closest(".provider-switcher")) return "custom-select-provider";
+  return "custom-select-field";
+}
+
+function closeCustomSelects(except) {
+  document.querySelectorAll(".custom-select-open").forEach((wrapper) => {
+    if (wrapper !== except) {
+      wrapper.classList.remove("custom-select-open");
+      wrapper.querySelector(".custom-select-trigger")?.setAttribute("aria-expanded", "false");
+    }
+  });
+}
+
+function syncCustomSelect(select) {
+  const ui = select._customSelect;
+  if (!ui) return;
+  const selected = select.selectedOptions[0] || select.options[0];
+  ui.label.textContent = selected?.textContent || "";
+  ui.wrapper.hidden = select.hidden;
+  ui.button.disabled = select.disabled;
+  ui.button.setAttribute("aria-expanded", String(ui.wrapper.classList.contains("custom-select-open")));
+  ui.menu.replaceChildren(...[...select.options].map((option, index) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "custom-select-option";
+    item.dataset.index = String(index);
+    item.textContent = option.textContent;
+    item.disabled = option.disabled;
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", String(option.selected));
+    return item;
+  }));
+}
+
+function enhanceCustomSelect(select) {
+  if (select.dataset.customSelect === "true") {
+    syncCustomSelect(select);
+    return;
+  }
+  const wrapper = document.createElement("span");
+  wrapper.className = `custom-select ${customSelectKind(select)}`;
+  const host = select.parentElement;
+  host?.classList.add("has-custom-select");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "custom-select-trigger";
+  button.setAttribute("aria-haspopup", "listbox");
+  button.setAttribute("aria-label", select.getAttribute("aria-label") || "选择");
+  const label = document.createElement("span");
+  const menu = document.createElement("div");
+  menu.className = "custom-select-menu";
+  menu.setAttribute("role", "listbox");
+  button.append(label);
+  select.parentNode.insertBefore(wrapper, select);
+  wrapper.append(select, button, menu);
+  select.dataset.customSelect = "true";
+  select.classList.add("custom-select-native");
+  select.tabIndex = -1;
+  select._customSelect = { wrapper, button, label, menu };
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (select.disabled || select.hidden) return;
+    const open = !wrapper.classList.contains("custom-select-open");
+    closeCustomSelects(wrapper);
+    wrapper.classList.toggle("custom-select-open", open);
+    syncCustomSelect(select);
+  });
+  button.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      wrapper.classList.remove("custom-select-open");
+    } else if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      button.click();
+    }
+  });
+  menu.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-index]");
+    if (!item) return;
+    select.selectedIndex = Number(item.dataset.index);
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    wrapper.classList.remove("custom-select-open");
+    syncCustomSelect(select);
+    button.focus();
+  });
+  select.addEventListener("change", () => syncCustomSelect(select));
+  syncCustomSelect(select);
+}
+
+function enhanceCustomSelects() {
+  document.querySelectorAll("select").forEach(enhanceCustomSelect);
+}
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".custom-select")) closeCustomSelects();
+});
+
 function refreshIcons() {
   window.lucide?.createIcons({ attrs: { "stroke-width": 1.8 } });
+  enhanceCustomSelects();
 }
 
 function renderWords(entry, className = "word-grid") {
@@ -250,15 +359,6 @@ function formatTime(timestamp) {
   const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
   if (date.toDateString() === yesterday.toDateString()) return "昨天";
   return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
-}
-
-function dayKey(timestamp) {
-  const date = new Date(timestamp);
-  const today = new Date();
-  if (date.toDateString() === today.toDateString()) return "今天";
-  const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return "昨天";
-  return "更早";
 }
 
 function reviewState(entry) {
@@ -283,6 +383,15 @@ function formatInterval(days) {
   return `${Math.round(days / 30)}个月`;
 }
 
+function stableJitter(id) {
+  let hash = 2_166_136_261;
+  for (const character of String(id || "")) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return 0.9 + ((hash >>> 0) % 21) / 100;
+}
+
 function previewInterval(entry, grade) {
   const review = reviewState(entry);
   let interval = grade === "again"
@@ -292,7 +401,7 @@ function previewInterval(entry, grade) {
       : grade === "easy"
         ? review.repetitions === 0 ? 4 : review.repetitions === 1 ? 8 : Math.max(8, review.intervalDays * (review.ease + 0.15) * 1.3)
         : review.repetitions === 0 ? 1 : review.repetitions === 1 ? 3 : Math.max(3, review.intervalDays * review.ease);
-  if (review.repetitions + (grade === "hard" ? 0 : 1) > 1 && grade !== "again") interval *= 0.9 + (Math.floor(Date.now() / 60_000) % 21) / 100;
+  if (review.repetitions + (grade === "hard" ? 0 : 1) > 1 && grade !== "again") interval *= stableJitter(entry.id);
   return Math.round(interval * 100) / 100;
 }
 
@@ -536,6 +645,7 @@ function renderNavigation() {
   const sources = [...new Set(state.entries.map((entry) => entry.source).filter(Boolean))];
   elements.filterSelect.innerHTML = `<option value="all">全部</option><option value="starred">收藏 (${starCount})</option>${sources.map((source) => `<option value="source:${escapeHtml(source)}">${escapeHtml(source)}</option>`).join("")}`;
   elements.filterSelect.value = state.view === "starred" ? "starred" : state.sourceFilter ? `source:${state.sourceFilter}` : "all";
+  syncCustomSelect(elements.filterSelect);
   elements.captureGrid.hidden = state.view === "review";
   elements.libraryHead.hidden = state.view === "review";
   elements.capturePage.hidden = state.view !== "capture";
@@ -598,7 +708,19 @@ function toast(message, action) {
   }
   elements.toast.classList.add("visible");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => elements.toast.classList.remove("visible"), 2600);
+  toast.timer = setTimeout(() => elements.toast.classList.remove("visible"), action ? 8000 : 2600);
+}
+
+function confirmAction(message, { title = "确认操作", confirmLabel = "确认" } = {}) {
+  elements.confirmTitle.textContent = title;
+  elements.confirmMessage.textContent = message;
+  elements.confirmAccept.textContent = confirmLabel;
+  elements.confirmDialog.returnValue = "";
+  return new Promise((resolve) => {
+    const finish = () => resolve(elements.confirmDialog.returnValue === "confirm");
+    elements.confirmDialog.addEventListener("close", finish, { once: true });
+    elements.confirmDialog.showModal();
+  });
 }
 
 function setBusy(value) {
@@ -623,8 +745,10 @@ function configDraft() {
     providerId: elements.providerSelect.value,
     name: elements.providerName.value.trim(),
     apiStyle: apiStyleInput()?.value || "responses",
+    reasoningEffort: elements.reasoningEffort.value,
     baseUrl: elements.apiBaseUrl.value.trim(),
     model: elements.apiModel.value.trim(),
+    enableThinkingToggle: elements.enableThinkingToggle.checked,
     allowNoKey: elements.allowNoKey.checked,
     ...(apiKey ? { apiKey } : {}),
   };
@@ -671,6 +795,7 @@ function renderAiState() {
     select.value = config.providerId || "";
     select.title = title;
     select.hidden = providers.length === 0;
+    syncCustomSelect(select);
   }
   elements.aiState.hidden = providers.length > 0;
   elements.captureAiState.hidden = providers.length > 0;
@@ -692,8 +817,11 @@ function applyAiStatus(config, fillForm = false) {
   const providers = config.providers || [];
   elements.providerSelect.innerHTML = `${providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`).join("")}<option value="">新增 Provider…</option>`;
   elements.providerSelect.value = config.providerId || "";
+  syncCustomSelect(elements.providerSelect);
   elements.providerName.value = config.providerName === "新 Provider" ? "" : config.providerName || "";
   elements.deleteProvider.disabled = !config.providerId;
+  elements.reasoningEffort.value = ["auto", "none", "low", "medium", "high"].includes(config.reasoningEffort) ? config.reasoningEffort : "auto";
+  elements.enableThinkingToggle.checked = Boolean(config.enableThinkingToggle);
   const radio = document.querySelector(`input[name="api-style"][value="${config.apiStyle}"]`);
   if (radio) radio.checked = true;
   elements.apiBaseUrl.value = config.baseUrl || "https://api.openai.com/v1";
@@ -776,9 +904,12 @@ async function saveAiConfig(event) {
 
 function newProvider() {
   elements.providerSelect.value = "";
+  syncCustomSelect(elements.providerSelect);
   elements.providerName.value = "";
   document.querySelector('input[name="api-style"][value="responses"]').checked = true;
   elements.apiBaseUrl.value = "https://api.openai.com/v1";
+  elements.reasoningEffort.value = "auto";
+  elements.enableThinkingToggle.checked = false;
   elements.apiKey.value = "";
   elements.apiKey.placeholder = "输入 API Key";
   elements.apiModel.value = "";
@@ -801,7 +932,7 @@ async function activateProvider(providerId = elements.providerSelect.value, fill
 async function deleteProvider() {
   const id = elements.providerSelect.value;
   const name = elements.providerSelect.selectedOptions[0]?.textContent || "这个 Provider";
-  if (!id || !confirm(`删除“${name}”？本机保存的密钥也会一并删除。`)) return;
+  if (!id || !await confirmAction(`删除“${name}”？本机保存的密钥也会一并删除。`, { title: "删除 Provider", confirmLabel: "删除" })) return;
   const result = await requestJson(`/api/config/${id}`, { method: "DELETE" });
   applyAiStatus(result, true);
   toast("Provider 已删除");
@@ -815,12 +946,12 @@ function syncAppearanceControls() {
   elements.sendShortcut.value = appearance.sendShortcut;
 }
 
-async function submitFragment(event) {
+async function submitFragment(event, forceNew = false, overrideText = "") {
   event.preventDefault();
   const form = event.currentTarget;
   const input = form.querySelector("textarea");
   const source = form.querySelector("select");
-  const text = input.value.trim();
+  const text = (overrideText || input.value).trim();
   if (!text || state.busy || !state.storageReady) return;
   const active = state.entries.find((entry) => entry.id === state.activeThreadId);
   const pending = { id: crypto.randomUUID(), controller: new AbortController() };
@@ -831,7 +962,7 @@ async function submitFragment(event) {
     const result = await requestJson(active ? `/api/entries/${active.id}/followups` : "/api/entries", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(active ? { text } : { text, source: source.value }),
+      body: JSON.stringify(active ? { text } : { text, source: source.value, ...(forceNew ? { forceNew: true } : {}) }),
       signal: pending.controller.signal,
       requestId: pending.id,
     });
@@ -840,14 +971,20 @@ async function submitFragment(event) {
       state.entries[state.entries.findIndex((entry) => entry.id === active.id)] = result.entry;
       state.selectedEntryId = active.id;
     } else {
-      state.entries.unshift(result.entry);
+      const returnedEntries = Array.isArray(result.entries) && result.entries.length ? result.entries : [result.entry];
+      const additions = returnedEntries.filter((item) => !state.entries.some((entry) => entry.id === item.id));
+      state.entries.unshift(...additions);
       state.selectedEntryId = result.entry.id;
       state.view = "all";
       state.sourceFilter = "";
     }
     input.value = "";
     input.style.height = "auto";
-    toast(result.duplicate ? "词库中已有这个片段" : result.demo ? "已保存；当前为演示解释" : "已保存为独立片段");
+    const duplicateAction = result.duplicate ? { label: "仍然新建", run: () => submitFragment({ preventDefault() {}, currentTarget: form }, true, text) } : undefined;
+    const splitMessage = result.split
+      ? `已拆分：新建 ${result.createdCount || 0} 个${result.reusedCount ? `，复用 ${result.reusedCount} 个` : ""}`
+      : result.duplicate ? "词库中已有这个片段" : result.demo ? "已保存；当前为演示解释" : "已保存为独立片段";
+    toast(splitMessage, duplicateAction);
   } catch (error) {
     const stopped = pending.controller.signal.aborted || error.name === "AbortError" || error.message === "请求已暂停";
     toast(stopped ? "已停止，内容未保存" : (error.message || "解释失败"));
@@ -877,7 +1014,7 @@ function newFragment() {
 async function rewindThread(entry, turnId) {
   const turn = entry.thread.find((item) => item.id === turnId);
   const target = turn ? `第 ${entry.thread.indexOf(turn) + 1} 轮` : "原片段";
-  if (!confirm(`回退到${target}？之后的追问会从本机记录中移除。`)) return;
+  if (!await confirmAction(`回退到${target}？之后的追问会从本机记录中移除。`, { title: "回退追问", confirmLabel: "回退" })) return;
   const snapshot = structuredClone(state.entries);
   const result = await requestJson(`/api/entries/${entry.id}/followups`, {
     method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ turnId: turnId || "" }),
@@ -975,7 +1112,8 @@ async function handleAction(action, id, grade, turnId) {
     });
     state.entries[state.entries.indexOf(entry)] = result.entry;
   }
-  if (action === "delete" && entry && confirm(`删除“${entry.displayText || entry.raw}”？`)) {
+  if (action === "delete" && entry) {
+    if (!await confirmAction(`删除“${entry.displayText || entry.raw}”？`, { title: "删除片段", confirmLabel: "删除" })) return;
     const snapshot = structuredClone(state.entries);
     await requestJson(`/api/entries/${entry.id}`, { method: "DELETE" });
     state.entries = state.entries.filter((item) => item.id !== entry.id);
@@ -987,7 +1125,7 @@ async function handleAction(action, id, grade, turnId) {
     const link = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: `拾词-${new Date().toISOString().slice(0, 10)}.json` });
     link.click(); URL.revokeObjectURL(link.href); toast("已导出 JSON"); return;
   }
-  if (action === "reset" && confirm("恢复演示数据会替换本机片段库里的所有内容，继续吗？")) {
+  if (action === "reset" && await confirmAction("恢复演示数据会替换本机片段库里的所有内容，继续吗？", { title: "恢复演示数据", confirmLabel: "替换" })) {
     const snapshot = structuredClone(state.entries);
     const result = await requestJson("/api/entries", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entries: seedEntries }),
@@ -1180,4 +1318,4 @@ load().catch((error) => toast(error.message || "无法读取本地数据")).fina
   state.busy = false;
   render();
 });
-if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=18").catch(() => {});
+if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=23").catch(() => {});

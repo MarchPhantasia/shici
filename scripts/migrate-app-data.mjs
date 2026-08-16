@@ -1,14 +1,9 @@
 import { chmod, copyFile, mkdir } from "node:fs/promises";
 import { constants } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveDataRoot } from "./data-root.mjs";
 
-const roots = {
-  darwin: join(homedir(), "Library", "Application Support", "com.pha.shici"),
-  win32: join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "com.pha.shici"),
-  linux: join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "com.pha.shici"),
-};
-const target = roots[process.platform];
+const target = resolveDataRoot();
 if (!target) process.exit(0);
 
 await mkdir(target, { recursive: true, mode: 0o700 });

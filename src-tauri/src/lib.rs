@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Mutex as StdMutex,
+    sync::{Mutex as StdMutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
@@ -14,7 +14,17 @@ use url::Url;
 use uuid::Uuid;
 
 const DAY_MS: f64 = 86_400_000.0;
+const MAX_OUTPUT_TOKENS: u64 = 4_000;
+const CAPABILITY_TTL_MS: f64 = 30.0 * 60_000.0;
 const SYSTEM_PROMPT: &str = include_str!("../../system-prompt.txt");
+#[derive(Clone, Copy, Default)]
+struct AiCapabilities {
+    structured: Option<bool>,
+    reasoning: Option<bool>,
+    at: f64,
+}
+
+static AI_CAPABILITIES: OnceLock<StdMutex<HashMap<String, AiCapabilities>>> = OnceLock::new();
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +56,8 @@ struct AiConfig {
     base_url: String,
     api_key: String,
     model: String,
+    reasoning_effort: String,
+    enable_thinking_toggle: bool,
     allow_no_key: bool,
 }
 
@@ -123,6 +135,99 @@ fn word_parts(raw: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn normalize_token(value: &str) -> String {
+    value
+        .to_lowercase()
+        .trim_matches(|char: char| !char.is_alphanumeric() && !matches!(char, '\'' | '’'))
+        .to_string()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (i, left_char) in left.chars().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, right_char) in right.iter().enumerate() {
+            current.push(
+                (current[j] + 1)
+                    .min(previous[j + 1] + 1)
+                    .min(previous[j] + usize::from(left_char != *right_char)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn claim_original(
+    original_parts: &[String],
+    used: &mut std::collections::HashSet<usize>,
+    text: &str,
+    preferred: &str,
+) -> String {
+    let find_exact = |target: &str| {
+        original_parts
+            .iter()
+            .enumerate()
+            .find(|(index, part)| {
+                !used.contains(index) && normalize_token(part) == normalize_token(target)
+            })
+            .map(|(index, _)| index)
+    };
+    let mut index = if preferred.is_empty() {
+        None
+    } else {
+        find_exact(preferred)
+    };
+    if index.is_none() {
+        index = find_exact(text);
+    }
+    if index.is_none() {
+        let target = normalize_token(text);
+        index = original_parts
+            .iter()
+            .enumerate()
+            .filter(|(part_index, _)| !used.contains(part_index))
+            .filter_map(|(part_index, part)| {
+                let distance = edit_distance(&normalize_token(part), &target);
+                (distance < 3).then_some((distance, part_index))
+            })
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, part_index)| part_index);
+    }
+    let Some(index) = index else {
+        return String::new();
+    };
+    used.insert(index);
+    original_parts[index].clone()
+}
+
+fn normalize_word_correction(raw: &str, text: &str, correction: &str) -> String {
+    let supplied = correction.trim();
+    if !supplied.is_empty() {
+        let parts = supplied
+            .split_once('→')
+            .or_else(|| supplied.split_once("->"));
+        if let Some((before, after)) = parts {
+            let before = normalize_token(before);
+            let after = normalize_token(after);
+            if !before.is_empty() && !after.is_empty() {
+                return format!("{before} → {after}");
+            }
+        }
+    }
+    let before = normalize_token(raw);
+    let after = normalize_token(text);
+    let inflection = (before.ends_with("ed") && before.trim_end_matches("ed") == after)
+        || (before.ends_with("ing") && before.trim_end_matches("ing") == after)
+        || (before.ends_with('s') && before.trim_end_matches('s') == after);
+    if !before.is_empty() && before != after && !inflection && edit_distance(&before, &after) <= 2 {
+        format!("{before} → {after}")
+    } else {
+        String::new()
+    }
 }
 
 fn is_word_token(value: &str) -> bool {
@@ -411,6 +516,13 @@ fn normalize_base(value: &str) -> Result<String, String> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
+fn normalize_reasoning_effort(value: Option<&Value>) -> String {
+    match text(value, 16).as_str() {
+        "none" | "low" | "medium" | "high" => text(value, 16),
+        _ => "auto".into(),
+    }
+}
+
 fn normalize_saved_config(value: Value) -> Value {
     if let Some(items) = value.get("providers").and_then(Value::as_array) {
         let providers = items
@@ -425,6 +537,8 @@ fn normalize_saved_config(value: Value) -> Value {
                     "baseUrl": text(provider.get("baseUrl"), 2_000),
                     "apiKey": text(provider.get("apiKey"), 10_000),
                     "model": text(provider.get("model"), 500),
+                    "reasoningEffort": normalize_reasoning_effort(provider.get("reasoningEffort")),
+                    "enableThinkingToggle": boolean(provider.get("enableThinkingToggle"), false),
                     "allowNoKey": boolean(provider.get("allowNoKey"), false)
                 }))
             })
@@ -448,7 +562,7 @@ fn normalize_saved_config(value: Value) -> Value {
             "id":"default","name":"默认 Provider",
             "apiStyle":if text(value.get("apiStyle"),32)=="compatible"{"compatible"}else{"responses"},
             "baseUrl":text(value.get("baseUrl"),2_000),"apiKey":text(value.get("apiKey"),10_000),
-            "model":text(value.get("model"),500),"allowNoKey":boolean(value.get("allowNoKey"),false)
+            "model":text(value.get("model"),500),"reasoningEffort":normalize_reasoning_effort(value.get("reasoningEffort")),"enableThinkingToggle":boolean(value.get("enableThinkingToggle"),false),"allowNoKey":boolean(value.get("allowNoKey"),false)
         }]});
     }
     json!({"version":2,"activeProviderId":"","providers":[]})
@@ -517,7 +631,7 @@ impl Backend {
             .and_then(|item| item.get("baseUrl"))
             .map(|value| normalize_base(&text(Some(value), 2_000)))
             .transpose()?;
-        let base_matches_provider = provider_base_url.as_deref().map_or(true, |saved| {
+        let base_matches_provider = provider_base_url.as_deref().is_none_or(|saved| {
             !override_map.is_some_and(|map| map.contains_key("baseUrl")) || saved == base_url
         });
         let allow_no_key = boolean(pick("allowNoKey"), false);
@@ -536,6 +650,8 @@ impl Backend {
         } else {
             "responses".into()
         };
+        let reasoning_effort = normalize_reasoning_effort(pick("reasoningEffort"));
+        let enable_thinking_toggle = boolean(pick("enableThinkingToggle"), false);
         Ok(AiConfig {
             provider_id: text(provider.and_then(|item| item.get("id")), 80),
             provider_name: text(provider.and_then(|item| item.get("name")), 80)
@@ -544,6 +660,8 @@ impl Backend {
             base_url,
             api_key,
             model: text(pick("model"), 500),
+            reasoning_effort,
+            enable_thinking_toggle,
             allow_no_key,
         })
     }
@@ -553,7 +671,7 @@ impl Backend {
         let providers = self.saved_config.get("providers").and_then(Value::as_array).into_iter().flatten().filter_map(|provider| {
             let id = text(provider.get("id"), 80);
             let item = self.resolve_config(Some(&json!({"providerId":id}))).ok()?;
-            Some(json!({"id":id,"name":item.provider_name,"apiStyle":item.api_style,"baseUrl":item.base_url,"model":item.model,"allowNoKey":item.allow_no_key,"hasApiKey":!item.api_key.is_empty(),"configured":item.configured()}))
+            Some(json!({"id":id,"name":item.provider_name,"apiStyle":item.api_style,"baseUrl":item.base_url,"model":item.model,"reasoningEffort":item.reasoning_effort,"enableThinkingToggle":item.enable_thinking_toggle,"allowNoKey":item.allow_no_key,"hasApiKey":!item.api_key.is_empty(),"configured":item.configured()}))
         }).collect::<Vec<_>>();
         Ok(json!({
             "providerId": config.provider_id,
@@ -563,6 +681,8 @@ impl Backend {
             "apiStyle": config.api_style,
             "baseUrl": config.base_url,
             "model": config.model,
+            "reasoningEffort": config.reasoning_effort,
+            "enableThinkingToggle": config.enable_thinking_toggle,
             "allowNoKey": config.allow_no_key,
             "hasApiKey": !config.api_key.is_empty(),
             "configured": config.configured(),
@@ -587,7 +707,7 @@ impl Backend {
         if current.api_key.is_empty() && !current.allow_no_key {
             return Err("请填写 API Key，或允许无密钥服务".into());
         }
-        let provider = json!({"id":provider_id.clone(),"name":text(body.get("name"),80).if_empty("未命名 Provider"),"apiStyle":current.api_style,"baseUrl":current.base_url,"model":current.model,"allowNoKey":current.allow_no_key,"apiKey":current.api_key});
+        let provider = json!({"id":provider_id.clone(),"name":text(body.get("name"),80).if_empty("未命名 Provider"),"apiStyle":current.api_style,"baseUrl":current.base_url,"model":current.model,"reasoningEffort":current.reasoning_effort,"enableThinkingToggle":current.enable_thinking_toggle,"allowNoKey":current.allow_no_key,"apiKey":current.api_key});
         let mut providers = self.saved_config["providers"]
             .as_array()
             .cloned()
@@ -735,7 +855,102 @@ impl Backend {
         source: String,
         result: Value,
         config: &AiConfig,
+        force_new: bool,
     ) -> Result<Value, String> {
+        if !force_new {
+            if let Some(entry) = self.duplicate_entry(&fragment) {
+                return Ok(
+                    json!({"entry":entry.clone(),"entries":[entry],"duplicate":true,"demo":false}),
+                );
+            }
+        }
+        let split_words = if text(result.get("kind"), 24) == "word_list" {
+            let words = result
+                .get("words")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if words.len() > 1 {
+                words
+            } else {
+                word_parts(&fragment)
+                    .into_iter()
+                    .map(|word| json!({"text":word}))
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        let split_words = split_words
+            .into_iter()
+            .filter(|word| !text(word.get("text"), 200).is_empty())
+            .collect::<Vec<_>>();
+        if split_words.len() > 1 {
+            let created = now_ms();
+            let original_parts = word_parts(&fragment);
+            let mut used = std::collections::HashSet::new();
+            let entries = split_words
+                .into_iter()
+                .filter_map(|word| {
+                    let word_text = text(word.get("text"), 200);
+                    if word_text.is_empty() {
+                        return None;
+                    }
+                    let raw = claim_original(&original_parts, &mut used, &word_text, &text(word.get("original"), 200));
+                    let raw = if raw.is_empty() { word_text.clone() } else { raw };
+                    let pronunciation = text(word.get("pronunciation"), 500);
+                    let correction = normalize_word_correction(&raw, &word_text, &text(word.get("correction"), 200));
+                    let meaning = {
+                        let value = text(word.get("meaning"), 1_000);
+                        if value.is_empty() {
+                            text(result.get("meaning"), 5_000)
+                        } else {
+                            value
+                        }
+                    };
+                    clean_entry(&json!({
+                        "id":Uuid::new_v4().to_string(), "raw":raw, "kind":"word", "words":[{
+                            "text":word_text, "pronunciation":pronunciation, "meaning":meaning
+                        }], "displayText":word_text, "correction":correction, "pronunciation":pronunciation,
+                        "meaning":meaning, "context":"", "usage":[], "chunks":[],
+                        "source":source.clone(), "status":"review", "starred":false, "createdAt":created, "updatedAt":created,
+                        "baseConclusion":meaning, "conclusion":meaning, "review":{"dueAt":created + 600_000.0}, "thread":[]
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let mut returned = Vec::with_capacity(entries.len());
+            let mut created_entries = Vec::with_capacity(entries.len());
+            let mut seen = HashMap::new();
+            let mut reused_count = 0;
+            for entry in &entries {
+                let raw = text(entry.get("raw"), 200);
+                let display = text(entry.get("displayText"), 200);
+                let display_key = display.to_lowercase();
+                let duplicate = if force_new {
+                    None
+                } else {
+                    seen.get(&display_key)
+                        .cloned()
+                        .or_else(|| self.duplicate_entry(&raw))
+                        .or_else(|| self.duplicate_entry(&display))
+                };
+                if let Some(duplicate) = duplicate {
+                    returned.push(duplicate);
+                    reused_count += 1;
+                } else {
+                    returned.push(entry.clone());
+                    seen.insert(display_key, entry.clone());
+                    created_entries.push(entry.clone());
+                }
+            }
+            for entry in created_entries.iter().rev() {
+                self.entries_mut().insert(0, entry.clone());
+            }
+            self.save_library()?;
+            return Ok(
+                json!({"entry":returned.first().cloned().unwrap_or(Value::Null),"entries":returned,"split":true,"duplicate":reused_count > 0,"createdCount":created_entries.len(),"reusedCount":reused_count,"demo":!config.configured()}),
+            );
+        }
         let created = now_ms();
         let entry = clean_entry(&json!({
             "id": Uuid::new_v4().to_string(), "raw": fragment,
@@ -751,7 +966,7 @@ impl Backend {
         })).ok_or("无法创建片段")?;
         self.entries_mut().insert(0, entry.clone());
         self.save_library()?;
-        Ok(json!({"entry": entry, "demo": !config.configured()}))
+        Ok(json!({"entry": entry, "entries":[entry], "demo": !config.configured()}))
     }
 
     fn prepare_followup(
@@ -806,13 +1021,32 @@ impl Backend {
         cancellation: Option<watch::Receiver<bool>>,
     ) -> Result<Value, String> {
         let (fragment, source, payload, config) = self.prepare_new_entry(body)?;
-        if let Some(entry) = self.duplicate_entry(&fragment) {
-            return Ok(json!({"entry":entry,"duplicate":true,"demo":false}));
+        let force_new = boolean(body.get("forceNew"), false);
+        if !force_new {
+            if let Some(entry) = self.duplicate_entry(&fragment) {
+                return Ok(
+                    json!({"entry":entry.clone(),"entries":[entry],"duplicate":true,"demo":false}),
+                );
+            }
+            if text(payload.get("kindHint"), 24) == "word_list" {
+                let parts = word_parts(&fragment);
+                let hits = parts
+                    .iter()
+                    .map(|part| self.duplicate_entry(part))
+                    .collect::<Option<Vec<_>>>();
+                if parts.len() > 1 {
+                    if let Some(entries) = hits {
+                        return Ok(
+                            json!({"entry":entries.first().cloned().unwrap_or(Value::Null),"entries":entries,"split":true,"duplicate":true,"createdCount":0,"reusedCount":parts.len(),"demo":false}),
+                        );
+                    }
+                }
+            }
         }
         let result = self
             .explain_cancellable(&payload, &config, cancellation)
             .await?;
-        self.commit_new_entry(fragment, source, result, &config)
+        self.commit_new_entry(fragment, source, result, &config, force_new)
     }
 
     async fn add_followup(
@@ -910,7 +1144,7 @@ impl Backend {
             .iter_mut()
             .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
             .ok_or("没有找到这个片段")?;
-        entry["review"] = schedule_review(&entry["review"], &grade);
+        entry["review"] = schedule_review(&entry["review"], &grade, id);
         entry["status"] = json!(if grade == "again" {
             "review"
         } else {
@@ -970,7 +1204,7 @@ impl Backend {
             return Ok((200, self.replace_entries(&request.body)?));
         }
         if path == "/api/entries" && method == "POST" {
-            return Ok((201, self.create_entry(&request.body, cancellation).await?));
+            return Ok((200, self.create_entry(&request.body, cancellation).await?));
         }
         let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
         if parts.len() == 4
@@ -1064,7 +1298,7 @@ async fn fetch_json_with_client(
                     .await;
                 continue;
             }
-            return Err(format!(
+            let message = format!(
                 "上游请求失败 ({})：{}",
                 status.as_u16(),
                 value
@@ -1072,11 +1306,38 @@ async fn fetch_json_with_client(
                     .and_then(Value::as_str)
                     .or_else(|| value.get("message").and_then(Value::as_str))
                     .unwrap_or("上游请求失败")
+            );
+            return Err(status_error(status.as_u16(), &message));
+        }
+        if value.get("status").and_then(Value::as_str) == Some("incomplete")
+            && value
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("max_output_tokens")
+        {
+            return Err(status_error(
+                502,
+                "模型输出被推理过程耗尽，请提高输出上限或降低推理程度",
             ));
         }
         return Ok(value);
     }
     Err("上游请求失败".into())
+}
+
+fn capability_error_dimensions(error: &str) -> (bool, bool) {
+    let error = error.to_lowercase();
+    let generic = error.contains("unsupported")
+        || error.contains("unrecognized")
+        || error.contains("unknown parameter")
+        || error.contains("invalid parameter");
+    (
+        generic || error.contains("response_format") || error.contains("json_schema"),
+        generic
+            || error.contains("reasoning")
+            || error.contains("chat_template")
+            || error.contains("thinking"),
+    )
 }
 
 async fn explain_with_client(
@@ -1089,19 +1350,39 @@ async fn explain_with_client(
     }
     let input = serde_json::to_string(payload).map_err(|error| error.to_string())?;
     let schema = response_schema(payload);
-    let request = |structured: bool| {
+    let capability_key = format!(
+        "{}|{}|{}|{}|{}",
+        config.provider_id,
+        config.api_style,
+        config.base_url,
+        config.model,
+        config.enable_thinking_toggle
+    );
+    let cached = AI_CAPABILITIES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|capabilities| capabilities.get(&capability_key).copied())
+        .filter(|capability| now_ms() - capability.at < CAPABILITY_TTL_MS)
+        .unwrap_or_default();
+    let has_reasoning = config.reasoning_effort != "auto";
+    let supports_chat_template = config.enable_thinking_toggle;
+    let request = |structured: bool, include_reasoning: bool| {
         let input = input.clone();
         let schema = schema.clone();
+        let reasoning_effort = config.reasoning_effort.clone();
         async move {
             if config.api_style == "responses" {
                 let mut body = json!({
                         "model": config.model,
                         "instructions": SYSTEM_PROMPT,
                         "input": input,
-                    "max_output_tokens": 1200
+                        "max_output_tokens": MAX_OUTPUT_TOKENS
                 });
+                if include_reasoning && reasoning_effort != "auto" {
+                    body["reasoning"] = json!({"effort":reasoning_effort});
+                }
                 if structured {
-                    body["stream"] = json!(true);
                     body["text"] = json!({"format":{"type":"json_schema","name":schema["name"],"strict":true,"schema":schema["schema"]}});
                 }
                 fetch_json_with_client(
@@ -1116,11 +1397,17 @@ async fn explain_with_client(
                 let mut body = json!({
                         "model": config.model,
                         "temperature": 0.2,
-                        "max_tokens": 1200,
+                        "max_tokens": MAX_OUTPUT_TOKENS,
                         "messages": [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":input}]
                 });
+                if include_reasoning && reasoning_effort != "auto" {
+                    body["reasoning_effort"] = json!(reasoning_effort);
+                    if supports_chat_template {
+                        body["chat_template_kwargs"] =
+                            json!({"enable_thinking":reasoning_effort != "none"});
+                    }
+                }
                 if structured {
-                    body["stream"] = json!(true);
                     body["response_format"] = json!({"type":"json_schema","json_schema":{"name":schema["name"],"strict":true,"schema":schema["schema"]}});
                 }
                 fetch_json_with_client(
@@ -1134,11 +1421,68 @@ async fn explain_with_client(
             }
         }
     };
-    let value = match request(true).await {
-        Ok(value) => value,
-        Err(error) if error.contains("(400)") => request(false).await?,
-        Err(error) => return Err(error),
+    let mut attempts = Vec::new();
+    let mut add_attempt = |structured: bool, include_reasoning: bool| {
+        if !attempts.contains(&(structured, include_reasoning)) {
+            attempts.push((structured, include_reasoning));
+        }
     };
+    if cached.structured != Some(false) {
+        if has_reasoning && cached.reasoning != Some(false) {
+            add_attempt(true, true);
+        }
+        add_attempt(true, false);
+    }
+    if has_reasoning && cached.reasoning != Some(false) {
+        add_attempt(false, true);
+    }
+    add_attempt(false, false);
+    let mut value = None;
+    let mut last_error = None;
+    let mut structured_capability_error = false;
+    let mut reasoning_capability_error = false;
+    for (structured, include_reasoning) in attempts {
+        match request(structured, include_reasoning).await {
+            Ok(result) => {
+                if let Ok(mut capabilities) = AI_CAPABILITIES
+                    .get_or_init(|| StdMutex::new(HashMap::new()))
+                    .lock()
+                {
+                    capabilities.insert(
+                        capability_key.clone(),
+                        AiCapabilities {
+                            structured: if structured {
+                                Some(true)
+                            } else if structured_capability_error {
+                                Some(false)
+                            } else {
+                                cached.structured
+                            },
+                            reasoning: if has_reasoning && include_reasoning {
+                                Some(true)
+                            } else if has_reasoning && reasoning_capability_error {
+                                Some(false)
+                            } else {
+                                cached.reasoning
+                            },
+                            at: now_ms(),
+                        },
+                    );
+                }
+                value = Some(result);
+                break;
+            }
+            Err(error) if error.contains("(400)") => {
+                let (structured_error, reasoning_error) = capability_error_dimensions(&error);
+                structured_capability_error |= structured_error;
+                reasoning_capability_error |= reasoning_error;
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let value =
+        value.ok_or_else(|| last_error.unwrap_or_else(|| "上游不支持当前请求格式 (400)".into()))?;
     let output = if config.api_style == "responses" {
         response_text(&value)
     } else {
@@ -1158,7 +1502,7 @@ fn response_schema(payload: &Value) -> Value {
             "name": "shici_entry",
             "schema": {"type":"object","additionalProperties":false,"properties":{
                 "type":{"type":"string"},"kind":{"type":"string","enum":["word","word_list","phrase","sentence","other"]},"displayText":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},
-                "words":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"}},"required":["text","pronunciation","meaning"]}},
+                "words":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"original":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"}},"required":["text","original","correction","pronunciation","meaning"]}},
                 "usage":{"type":"array","items":{"type":"string"}},"chunks":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"meaning":{"type":"string"}},"required":["text","meaning"]}},"memoryCue":{"type":"string"}
             },"required":["type","kind","displayText","correction","pronunciation","meaning","context","words","usage","chunks","memoryCue"]}
         })
@@ -1232,7 +1576,16 @@ impl EmptyFallback for String {
     }
 }
 
-fn schedule_review(review: &Value, grade: &str) -> Value {
+fn stable_jitter(id: &str) -> f64 {
+    let mut hash = 2_166_136_261_u32;
+    for byte in id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    0.9 + f64::from(hash % 21) / 100.0
+}
+
+fn schedule_review(review: &Value, grade: &str, id: &str) -> Value {
     let now = now_ms();
     let mut ease = number(review.get("ease"), 2.5).clamp(1.3, 3.2);
     let mut repetitions = integer(review.get("repetitions"), 0);
@@ -1281,7 +1634,7 @@ fn schedule_review(review: &Value, grade: &str) -> Value {
     };
     let mut interval = interval;
     if repetitions > 1 && grade != "again" {
-        interval *= 0.9 + ((now / 60_000.0) as u64 % 21) as f64 / 100.0;
+        interval *= stable_jitter(id);
     }
     interval = (interval * 100.0).round() / 100.0;
     json!({"dueAt":now + interval * DAY_MS,"intervalDays":interval,"ease":(ease*100.0).round()/100.0,"repetitions":repetitions,"lapses":lapses,"leech":lapses >= 8,"lastReviewedAt":now,"lastGrade":grade})
@@ -1322,7 +1675,11 @@ fn response_text(value: &Value) -> String {
 }
 
 fn parse_model_json(value: &str) -> Result<Value, String> {
-    let mut clean = value.trim();
+    let mut clean = value.replace("<think>", "");
+    if let Some(index) = clean.find("</think>") {
+        clean.replace_range(..index + "</think>".len(), "");
+    }
+    let mut clean = clean.trim();
     if let Some(value) = clean.strip_prefix("```json") {
         clean = value.trim();
     } else if let Some(value) = clean.strip_prefix("```") {
@@ -1331,7 +1688,41 @@ fn parse_model_json(value: &str) -> Result<Value, String> {
     if let Some(value) = clean.strip_suffix("```") {
         clean = value.trim();
     }
-    serde_json::from_str(clean).map_err(|error| format!("AI 返回格式不正确：{error}"))
+    if let Some(start) = clean.find(['{', '[']) {
+        clean = &clean[start..];
+    }
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (index, character) in clean.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            quoted = true;
+        } else if matches!(character, '{' | '[') {
+            depth += 1;
+        } else if matches!(character, '}' | ']') {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(index + character.len_utf8());
+                break;
+            }
+        }
+    }
+    if let Some(end) = end {
+        clean = &clean[..end];
+    }
+    serde_json::from_str(clean)
+        .map_err(|error| status_error(502, &format!("模型返回了无法解析的 JSON：{error}")))
 }
 
 fn demo_explain(payload: &Value) -> Value {
@@ -1355,7 +1746,25 @@ fn demo_explain(payload: &Value) -> Value {
     json!({"type":"entry","kind":kind,"displayText":fragment,"correction":"","pronunciation":"","words":words,"meaning":"演示模式不会猜测这个片段的具体含义。","context":"它已作为独立片段保存。配置 AI 后会生成语境化解释。","usage":[],"chunks":[],"memoryCue":"","demo":true})
 }
 
+fn status_error(status: u16, message: &str) -> String {
+    format!("[shici-status:{status}] {message}")
+}
+
+fn error_message(message: &str) -> String {
+    message
+        .strip_prefix("[shici-status:")
+        .and_then(|value| value.split_once("] "))
+        .map_or_else(|| message.to_string(), |(_, message)| message.to_string())
+}
+
 fn error_status(message: &str) -> u16 {
+    if let Some(status) = message
+        .strip_prefix("[shici-status:")
+        .and_then(|value| value.split_once(']'))
+        .and_then(|(status, _)| status.parse::<u16>().ok())
+    {
+        return status;
+    }
     if message == "请求已暂停" {
         499
     } else if message.contains("没有找到") {
@@ -1364,7 +1773,7 @@ fn error_status(message: &str) -> u16 {
         || message.contains("格式不正确")
         || message.contains("Base URL")
         || message.contains("请填写")
-        || message.contains("不支持")
+        || message.contains("API 方式")
     {
         400
     } else {
@@ -1398,13 +1807,19 @@ async fn api_request(
     let method = request.method.to_uppercase();
     let path = request.url.split('?').next().unwrap_or("").to_string();
     let result = if path == "/api/entries" && method == "POST" {
-        let duplicate = {
+        let force_new = boolean(request.body.get("forceNew"), false);
+        let duplicate = if force_new {
+            None
+        } else {
             let backend = state.backend.lock().await;
             let fragment = text(request.body.get("text"), 5_000);
             backend.duplicate_entry(&fragment)
         };
         if let Some(entry) = duplicate {
-            Ok((200, json!({"entry":entry,"duplicate":true,"demo":false})))
+            Ok((
+                200,
+                json!({"entry":entry.clone(),"entries":[entry],"duplicate":true,"demo":false}),
+            ))
         } else {
             let (fragment, source, payload, config, client) = {
                 let backend = state.backend.lock().await;
@@ -1417,8 +1832,8 @@ async fn api_request(
             let mut backend = state.backend.lock().await;
             generated.and_then(|result| {
                 backend
-                    .commit_new_entry(fragment, source, result, &config)
-                    .map(|body| (201, body))
+                    .commit_new_entry(fragment, source, result, &config, force_new)
+                    .map(|body| (200, body))
             })
         }
     } else if method == "POST" && path.starts_with("/api/entries/") && path.ends_with("/followups")
@@ -1456,7 +1871,7 @@ async fn api_request(
         Ok((status, body)) => ApiResponse { status, body },
         Err(message) => ApiResponse {
             status: error_status(&message),
-            body: json!({"error":message}),
+            body: json!({"error":error_message(&message)}),
         },
     })
 }
@@ -1503,11 +1918,22 @@ mod tests {
     fn review_intervals_are_adaptive() {
         let review = json!({"ease":2.5,"repetitions":0,"lapses":0,"intervalDays":0});
         assert_eq!(
-            schedule_review(&review, "again")["intervalDays"],
+            schedule_review(&review, "again", "entry-a")["intervalDays"],
             json!(0.01)
         );
-        assert_eq!(schedule_review(&review, "good")["intervalDays"], json!(1.0));
-        assert_eq!(schedule_review(&review, "easy")["intervalDays"], json!(4.0));
+        assert_eq!(
+            schedule_review(&review, "good", "entry-a")["intervalDays"],
+            json!(1.0)
+        );
+        assert_eq!(
+            schedule_review(&review, "easy", "entry-a")["intervalDays"],
+            json!(4.0)
+        );
+        let repeated = json!({"ease":2.5,"repetitions":2,"lapses":0,"intervalDays":3});
+        assert_ne!(
+            schedule_review(&repeated, "good", "entry-a")["intervalDays"],
+            schedule_review(&repeated, "good", "entry-b")["intervalDays"]
+        );
     }
 
     #[test]
@@ -1541,10 +1967,43 @@ mod tests {
     }
 
     #[test]
+    fn word_list_claims_original_tokens_without_index_assumptions() {
+        let mut used = std::collections::HashSet::new();
+        let original = word_parts("cherry, apple, banana");
+        assert_eq!(claim_original(&original, &mut used, "apple", ""), "apple");
+        assert_eq!(claim_original(&original, &mut used, "banana", ""), "banana");
+        assert_eq!(claim_original(&original, &mut used, "cherry", ""), "cherry");
+
+        let mut used = std::collections::HashSet::new();
+        let original = word_parts("running, jumped");
+        assert_eq!(
+            claim_original(&original, &mut used, "run", "running"),
+            "running"
+        );
+        assert_eq!(
+            claim_original(&original, &mut used, "jump", "jumped"),
+            "jumped"
+        );
+        assert_eq!(normalize_word_correction("jumped", "jump", ""), "");
+        assert_eq!(
+            normalize_word_correction("betta", "beta", "betta → beta"),
+            "betta → beta"
+        );
+    }
+
+    #[test]
     fn sse_deltas_are_aggregated() {
         let value = parse_sse(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\ndata: [DONE]\n",
         );
         assert_eq!(value["output_text"], json!("hello"));
+    }
+
+    #[test]
+    fn qwen_wrapped_json_is_parsed() {
+        let value =
+            parse_model_json("<think>先判断类型</think>\n```json\n{\"type\":\"entry\"}\n```")
+                .unwrap();
+        assert_eq!(value["type"], json!("entry"));
     }
 }

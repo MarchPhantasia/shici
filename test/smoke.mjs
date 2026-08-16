@@ -4,6 +4,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveDataRoot } from "../scripts/data-root.mjs";
+
+assert.equal(resolveDataRoot({ platform: "darwin", home: "/tmp/home", env: {} }), "/tmp/home/Library/Application Support/com.pha.shici");
+assert.equal(resolveDataRoot({ platform: "linux", home: "/tmp/home", env: { XDG_DATA_HOME: "/tmp/data" } }), "/tmp/data/com.pha.shici");
 
 function listen(server, port = 0) {
   return new Promise((resolve) => server.listen(port, "127.0.0.1", () => resolve(server.address().port)));
@@ -34,12 +38,35 @@ const mock = createServer(async (request, response) => {
   if (request.url === "/v1/responses") {
     const input = JSON.parse(body.input);
     if (input.text === "slow") await new Promise((resolve) => setTimeout(resolve, 300));
+    if (input.text === "incomplete") return response.end(JSON.stringify({ status: "incomplete", incomplete_details: { reason: "max_output_tokens" } }));
+    if (input.text.startsWith("capability-") && body.reasoning) {
+      response.statusCode = 400;
+      return response.end(JSON.stringify({ error: { message: "reasoning unsupported" } }));
+    }
     const result = input.text.includes("foodsteps")
       ? { type: "entry", kind: "sentence", displayText: "Her footsteps hurried as she all but fled the room.", correction: "foodsteps → footsteps", pronunciation: "", meaning: "她脚步匆匆，几乎是逃出了房间。", context: "纠错句", words: [], usage: [], chunks: [], memoryCue: "纠正 footsteps 后理解。" }
-      : input.text.includes(",")
+      : input.text === "gamma, deltta"
+        ? { type: "entry", kind: "word_list", displayText: input.text, correction: "deltta → delta", pronunciation: "", meaning: "两个独立单词", context: "词表", words: [{ text: "gamma", pronunciation: "/ˈɡæmə/", meaning: "伽马" }, { text: "delta", pronunciation: "/ˈdeltə/", meaning: "德尔塔" }], usage: [], chunks: [], memoryCue: "" }
+      : input.text === "omega, omega"
+          ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "重复单词", context: "词表", words: [{ text: "omega", pronunciation: "/ˈoʊmɪɡə/", meaning: "欧米伽" }, { text: "omega", pronunciation: "/ˈoʊmɪɡə/", meaning: "欧米伽" }], usage: [], chunks: [], memoryCue: "" }
+      : input.text === "alpha, xyzzy, banana"
+        ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "缺少一个模型不认识的词", context: "词表", words: [{ text: "alpha", pronunciation: "/ˈælfə/", meaning: "阿尔法" }, { text: "banana", pronunciation: "/bəˈnænə/", meaning: "香蕉" }], usage: [], chunks: [], memoryCue: "" }
+        : input.text === "running, jumped"
+          ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "词形还原", context: "词表", words: [{ text: "run", original: "running", correction: "", pronunciation: "/rʌn/", meaning: "跑" }, { text: "jump", original: "jumped", correction: "", pronunciation: "/dʒʌmp/", meaning: "跳" }], usage: [], chunks: [], memoryCue: "" }
+          : input.text === "cherry, apple, banana"
+            ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "乱序词表", context: "词表", words: [{ text: "apple", pronunciation: "/ˈæpəl/", meaning: "苹果" }, { text: "banana", pronunciation: "/bəˈnænə/", meaning: "香蕉" }, { text: "cherry", pronunciation: "/ˈtʃeri/", meaning: "樱桃" }], usage: [], chunks: [], memoryCue: "" }
+            : input.text === "epsilon, zetta"
+              ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "拼写纠错", context: "词表", words: [{ text: "epsilon", original: "epsilon", correction: "", pronunciation: "/ˈepsɪlɒn/", meaning: "艾普西隆" }, { text: "zeta", original: "zetta", correction: "zetta → zeta", pronunciation: "/ˈziːtə/", meaning: "泽塔" }], usage: [], chunks: [], memoryCue: "" }
+      : input.kindHint === "word_list" || input.text.includes(",")
         ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "两个独立单词", context: "词表", words: [{ text: "alpha", pronunciation: "/ˈælfə/", meaning: "阿尔法" }, { text: "beta", pronunciation: "/ˈbiːtə/", meaning: "贝塔" }], usage: [], chunks: [], memoryCue: "" }
+        : input.kindHint === "phrase" || input.kindHint === "sentence"
+          ? { type: "entry", kind: input.kindHint, displayText: input.text, correction: "", pronunciation: "", meaning: "保持原片段含义", context: "短语或句子", words: [], usage: [], chunks: [], memoryCue: "" }
         : { type: "entry", kind: "word", displayText: input.text, correction: "", pronunciation: "/test/", meaning: "响应成功", context: "Responses", words: [{ text: input.text, pronunciation: "/test/", meaning: "测试" }], usage: [], chunks: [], memoryCue: "" };
-    return response.end(JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify(result) }] }] }));
+    const fence = String.fromCharCode(96).repeat(3);
+    const outputText = input.text === "delete-me"
+      ? `<think>先确认这是一个可删除的测试词条</think>\n${fence}json\n${JSON.stringify(result)}\n${fence}`
+      : JSON.stringify(result);
+    return response.end(JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: outputText }] }] }));
   }
   if (request.url === "/v1/chat/completions") {
     const input = JSON.parse(body.messages.at(-1).content);
@@ -86,6 +113,13 @@ try {
   assert.equal(migratedConfig.providerId, "default");
   assert.equal(migratedConfig.providers.length, 1);
 
+  const invalidBase = await fetch(`${app}/api/config`, {
+    method: "PUT", headers,
+    body: JSON.stringify({ providerId: "default", baseUrl: "not-a-url", model: "alpha-model", apiKey: "test-secret" }),
+  });
+  assert.equal(invalidBase.status, 400);
+  assert.match((await invalidBase.json()).error, /Base URL/);
+
   const missingHeader = await fetch(`${app}/api/config`, { headers: { Origin: app } });
   assert.equal(missingHeader.status, 403);
   const blocked = await fetch(`${app}/api/config`, { headers: { Origin: "http://attacker.test", "X-Shici": "1" } });
@@ -93,9 +127,10 @@ try {
 
   const responsesConfig = await json(`${app}/api/config`, {
     method: "PUT", headers,
-    body: JSON.stringify({ providerId: "default", name: "Responses Test", apiStyle: "responses", baseUrl: `http://127.0.0.1:${mockPort}`, model: "alpha-model", allowNoKey: false }),
+    body: JSON.stringify({ providerId: "default", name: "Responses Test", apiStyle: "responses", baseUrl: `http://127.0.0.1:${mockPort}`, model: "alpha-model", reasoningEffort: "low", allowNoKey: false }),
   });
   assert.equal(responsesConfig.baseUrl, `http://127.0.0.1:${mockPort}/v1`);
+  assert.equal(responsesConfig.reasoningEffort, "low");
   assert.equal(responsesConfig.hasApiKey, true);
   assert.equal("apiKey" in responsesConfig, false);
   assert.deepEqual((await json(`${app}/api/entries`)).entries, []);
@@ -136,10 +171,12 @@ try {
   });
   assert.equal(leaked.status, 400);
 
-  const created = await json(`${app}/api/entries`, {
+  const createdResponse = await fetch(`${app}/api/entries`, {
     method: "POST", headers,
     body: JSON.stringify({ text: "test", source: "游戏" }),
   });
+  const created = await createdResponse.json();
+  assert.equal(createdResponse.status, 200);
   assert.equal(created.entry.meaning, "响应成功");
   assert.equal(created.entry.kind, "word");
   assert.equal(created.entry.pronunciation, "/test/");
@@ -147,7 +184,24 @@ try {
   assert.equal(created.entry.source, "游戏");
   assert.equal(created.entry.review.repetitions, 0);
   assert.equal(created.entry.review.dueAt > created.entry.createdAt, true);
-  assert.equal(calls.findLast((call) => call.path === "/v1/responses").body.stream, true);
+  assert.equal(calls.findLast((call) => call.path === "/v1/responses").body.stream, undefined);
+  assert.equal(calls.findLast((call) => call.path === "/v1/responses").body.max_output_tokens, 4000);
+  assert.equal(calls.findLast((call) => call.path === "/v1/responses").body.reasoning.effort, "low");
+
+  const incomplete = await fetch(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "incomplete", source: "" }),
+  });
+  assert.equal(incomplete.status, 502);
+  assert.match((await incomplete.json()).error, /输出被推理过程耗尽/);
+
+  const disposable = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "delete-me", source: "" }),
+  });
+  const deleted = await json(`${app}/api/entries/${disposable.entry.id}`, { method: "DELETE" });
+  assert.equal(deleted.deleted, true);
+  assert.equal((await json(`${app}/api/entries`)).entries.some((entry) => entry.id === disposable.entry.id), false);
 
   const duplicate = await json(`${app}/api/entries`, {
     method: "POST", headers,
@@ -155,6 +209,16 @@ try {
   });
   assert.equal(duplicate.duplicate, true);
   assert.equal(duplicate.entry.id, created.entry.id);
+  assert.deepEqual(duplicate.entries.map((entry) => entry.id), [created.entry.id]);
+
+  const forced = await fetch(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "test", source: "游戏", forceNew: true }),
+  });
+  assert.equal(forced.status, 200);
+  const forcedBody = await forced.json();
+  assert.equal(forcedBody.duplicate, undefined);
+  assert.notEqual(forcedBody.entry.id, created.entry.id);
 
   const updated = await json(`${app}/api/entries/${created.entry.id}`, {
     method: "PATCH", headers,
@@ -175,8 +239,88 @@ try {
     method: "POST", headers,
     body: JSON.stringify({ text: "alpha, beta", source: "阅读" }),
   });
-  assert.equal(wordList.entry.kind, "word_list");
-  assert.deepEqual(wordList.entry.words.map((word) => word.pronunciation), ["/ˈælfə/", "/ˈbiːtə/"]);
+  assert.equal(wordList.split, true);
+  assert.equal(wordList.entries.length, 2);
+  assert.deepEqual(wordList.entries.map((entry) => entry.kind), ["word", "word"]);
+  assert.deepEqual(wordList.entries.map((entry) => entry.raw), ["alpha", "beta"]);
+  assert.deepEqual(wordList.entries.map((entry) => entry.words[0].pronunciation), ["/ˈælfə/", "/ˈbiːtə/"]);
+
+  const repeatedWordListBefore = calls.length;
+  const repeatedWordListHit = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "alpha, beta", source: "阅读" }),
+  });
+  assert.equal(calls.length, repeatedWordListBefore);
+  assert.equal(repeatedWordListHit.createdCount, 0);
+  assert.equal(repeatedWordListHit.reusedCount, 2);
+
+  const missingWord = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "alpha, xyzzy, banana", source: "阅读" }),
+  });
+  assert.deepEqual(missingWord.entries.map((entry) => [entry.raw, entry.displayText]), [["alpha", "alpha"], ["banana", "banana"]]);
+
+  const lemmatizedWordList = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "running, jumped", source: "阅读" }),
+  });
+  assert.deepEqual(lemmatizedWordList.entries.map((entry) => [entry.raw, entry.displayText, entry.correction]), [["running", "run", ""], ["jumped", "jump", ""]]);
+
+  const reorderedWordList = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "cherry, apple, banana", source: "阅读" }),
+  });
+  assert.deepEqual(reorderedWordList.entries.map((entry) => [entry.raw, entry.displayText]), [["apple", "apple"], ["banana", "banana"], ["cherry", "cherry"]]);
+
+  const explicitlyCorrectedWordList = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "epsilon, zetta", source: "阅读" }),
+  });
+  assert.deepEqual(explicitlyCorrectedWordList.entries.map((entry) => [entry.raw, entry.displayText, entry.correction]), [["epsilon", "epsilon", ""], ["zetta", "zeta", "zetta → zeta"]]);
+
+  const correctedWordList = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "gamma, deltta", source: "阅读" }),
+  });
+  assert.deepEqual(correctedWordList.entries.map((entry) => entry.raw), ["gamma", "deltta"]);
+  assert.deepEqual(correctedWordList.entries.map((entry) => entry.displayText), ["gamma", "delta"]);
+  assert.equal(correctedWordList.entries[1].correction, "deltta → delta");
+  assert.deepEqual(correctedWordList.entries.map((entry) => entry.context), ["", ""]);
+
+  const repeatedWordList = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "omega, omega", source: "阅读" }),
+  });
+  assert.equal(repeatedWordList.split, true);
+  assert.equal(repeatedWordList.createdCount, 1);
+  assert.equal(repeatedWordList.reusedCount, 1);
+  assert.equal(repeatedWordList.duplicate, true);
+  assert.equal((await json(`${app}/api/entries`)).entries.filter((entry) => entry.raw === "omega").length, 1);
+
+  const capabilityFirst = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "capability-first", source: "阅读" }),
+  });
+  assert.equal(capabilityFirst.entry.kind, "word");
+  const capabilityCalls = calls.filter((call) => call.path === "/v1/responses" && JSON.parse(call.body.input).text === "capability-first");
+  assert.equal(capabilityCalls.length, 2);
+  assert.equal(capabilityCalls[0].body.reasoning.effort, "low");
+  assert.equal(capabilityCalls[1].body.reasoning, undefined);
+
+  await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "capability-second", source: "阅读" }),
+  });
+  const cachedCapabilityCalls = calls.filter((call) => call.path === "/v1/responses" && JSON.parse(call.body.input).text === "capability-second");
+  assert.equal(cachedCapabilityCalls.length, 1);
+  assert.equal(cachedCapabilityCalls[0].body.reasoning, undefined);
+
+  const phrase = await json(`${app}/api/entries`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "keep it close", source: "阅读" }),
+  });
+  assert.equal(phrase.entries.length, 1);
+  assert.equal(phrase.entry.kind, "phrase");
 
   const corrected = await json(`${app}/api/entries`, {
     method: "POST", headers,
@@ -200,9 +344,10 @@ try {
 
   const compatibleConfig = await json(`${app}/api/config`, {
     method: "PUT", headers,
-    body: JSON.stringify({ name: "Compatible Test", apiStyle: "compatible", baseUrl: `http://127.0.0.1:${mockPort}/v1`, apiKey: "second-secret", model: "beta-model", allowNoKey: false }),
+    body: JSON.stringify({ name: "Compatible Test", apiStyle: "compatible", baseUrl: `http://127.0.0.1:${mockPort}/v1`, apiKey: "second-secret", model: "beta-model", reasoningEffort: "none", enableThinkingToggle: true, allowNoKey: false }),
   });
   assert.equal(compatibleConfig.apiStyle, "compatible");
+  assert.equal(compatibleConfig.reasoningEffort, "none");
   assert.equal(compatibleConfig.hasApiKey, true);
   assert.equal(compatibleConfig.providers.length, 2);
 
@@ -211,6 +356,11 @@ try {
     body: JSON.stringify({ text: "why" }),
   });
   assert.equal(followup.entry.thread[0].answer, "回答：why");
+  const compatibleCall = calls.findLast((call) => call.path === "/v1/chat/completions");
+  assert.equal(compatibleCall.body.reasoning_effort, "none");
+  assert.equal(compatibleCall.body.chat_template_kwargs.enable_thinking, false);
+  assert.equal(compatibleCall.body.max_tokens, 4000);
+  assert.equal(compatibleCall.body.stream, undefined);
   const secondFollowup = await json(`${app}/api/entries/${created.entry.id}/followups`, {
     method: "POST", headers,
     body: JSON.stringify({ text: "again" }),
@@ -252,10 +402,11 @@ try {
   const stored = JSON.parse(await readFile(dataPath, "utf8"));
   const storedSettings = JSON.parse(await readFile(settingsPath, "utf8"));
   assert.equal(stored.version, 2);
-  assert.equal(stored.entries.some((entry) => entry.kind === "word_list" && entry.words.length === 2), true);
-  assert.equal(stored.entries.find((entry) => entry.raw === "test").thread.length, 1);
+  assert.equal(stored.entries.some((entry) => entry.raw === "alpha" && entry.kind === "word"), true);
+  assert.equal(stored.entries.some((entry) => entry.raw === "beta" && entry.kind === "word"), true);
+  assert.equal(stored.entries.find((entry) => entry.id === created.entry.id).thread.length, 1);
   assert.equal(stored.entries.find((entry) => entry.raw.includes("foodsteps")).displayText.includes("footsteps"), true);
-  assert.equal(stored.entries.find((entry) => entry.raw === "test").review.lastGrade, "good");
+  assert.equal(stored.entries.find((entry) => entry.id === created.entry.id).review.lastGrade, "good");
   assert.equal(storedSettings.providers.length, 2);
   assert.equal(storedSettings.providers.every((provider) => Object.hasOwn(provider, "apiKey")), true);
   console.log("smoke ok: cancellation, correction, rewind, providers, word IPA, review, atomic local data");

@@ -28,11 +28,11 @@ npm start
 
 默认使用 `Command/Ctrl + Enter` 发送，普通回车换行；也可以在设置中改成 `Shift + Enter` 或 `Enter`。
 
-浏览器开发版的 API Key 保存在本机服务端的 `.local/settings.json`，文件权限为 `0600`；页面只能读取是否已配置，不能取回密钥。Base URL 会自动规范到 `/v1`。
+浏览器开发版的 API Key 保存在本机服务端的应用数据目录 `settings.json`，文件权限为 `0600`；页面只能读取是否已配置，不能取回密钥。Base URL 会自动规范到 `/v1`。可用 `SHICI_DATA_DIR` 覆盖默认目录。
 
 环境变量仍可作为初始配置：`AI_API_STYLE`、`AI_API_KEY`、`AI_BASE_URL`、`AI_MODEL`，并兼容 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`。无需密钥的本地服务可设置 `AI_ALLOW_NO_KEY=1`，也可直接在界面勾选。
 
-片段、来源、复习状态和追问统一保存在本机服务端的 `.local/library.json`。写入时先生成临时文件再原子替换，文件权限为 `0600`；旧版浏览器 `localStorage` 数据会在首次启动时自动迁移。设置中仍可导出 JSON。
+片段、来源、复习状态和追问统一保存在本机服务端的应用数据目录 `library.json`。写入时先生成临时文件再原子替换，文件权限为 `0600`；旧版浏览器 `localStorage` 数据会在首次启动时自动迁移。设置中仍可导出 JSON。
 
 ## 跨平台 App
 

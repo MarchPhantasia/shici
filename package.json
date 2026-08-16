@@ -9,11 +9,16 @@
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build",
-    "check": "node --check server.mjs && node --check public/app.js && node --check test/smoke.mjs",
-    "test": "node test/smoke.mjs"
+    "check": "node --check server.mjs && node --check public/app.js && node --check test/smoke.mjs && npm run lint",
+    "lint": "eslint server.mjs public/app.js scripts/*.mjs test/smoke.mjs",
+    "test": "node test/smoke.mjs",
+    "ci": "npm run check && npm test && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo test --manifest-path src-tauri/Cargo.toml --no-default-features && cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --release && cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features -- -D warnings"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "2.11.4"
+    "@eslint/js": "9.39.5",
+    "@tauri-apps/cli": "2.11.4",
+    "eslint": "^9.39.5",
+    "globals": "^14.0.0"
   },
   "engines": {
     "node": ">=20"

@@ -4,9 +4,11 @@ Prioritize the meaning in the supplied fragment itself. Do not dump unrelated di
 Be concise, natural, and honest about ambiguity. Correct obvious typos only when confident.
 
 For mode "new", first classify the input as word, word_list, phrase, sentence, or other. Return only valid JSON with these keys:
-{"type":"entry","kind":"word","displayText":"","correction":"","pronunciation":"/IPA/","meaning":"","context":"","words":[{"text":"","pronunciation":"/IPA/","meaning":""}],"usage":[""],"chunks":[{"text":"","meaning":""}],"memoryCue":""}
+{"type":"entry","kind":"word","displayText":"","correction":"","pronunciation":"/IPA/","meaning":"","context":"","words":[{"text":"","original":"","correction":"","pronunciation":"/IPA/","meaning":""}],"usage":[""],"chunks":[{"text":"","meaning":""}],"memoryCue":""}
 - kind "word": exactly one standalone lexical word. pronunciation is required IPA; words contains exactly that word with IPA and its concise Chinese meaning.
 - kind "word_list": multiple standalone words rather than a phrase or sentence. words contains every word separately and pronunciation is required IPA for every item. Top-level pronunciation may be empty.
+- words[].original must echo the exact input token this word came from, verbatim. Use "" when the word cannot be attributed to a single input token.
+- words[].correction is non-empty only for a genuine spelling error, not lemmatization, inflection, or case normalization. Use the format "original → corrected".
 - kind "phrase" or "sentence": words must be []; pronunciation may be empty.
 - Distinguish a meaningful multi-word phrase from a list of unrelated vocabulary. Commas/newlines often signal a word_list, but use linguistic meaning as the final test.
 - meaning: one natural Chinese understanding, not a long essay.
@@ -23,3 +25,4 @@ For mode "followup", answer only within the supplied root fragment and local thr
 - answer: direct Chinese answer to the latest question.
 - summary: a compact updated conclusion for later review.
 Never refer to fragments outside the payload.
+Do not output markdown, code fences, XML tags, or a <think> block in the final answer. If the model internally reasons, keep that reasoning out of the response and return exactly one JSON object.

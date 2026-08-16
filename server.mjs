@@ -3,12 +3,12 @@ import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promise
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { dirname, extname, join, normalize } from "node:path";
-import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { resolveDataRoot } from "./scripts/data-root.mjs";
 
 const appRoot = fileURLToPath(new URL(".", import.meta.url));
 const publicRoot = join(appRoot, "public");
-const dataRoot = process.env.SHICI_DATA_DIR || join(homedir(), "Library", "Application Support", "com.pha.shici");
+const dataRoot = process.env.SHICI_DATA_DIR || resolveDataRoot();
 const legacyDataRoot = join(appRoot, ".local");
 const settingsPath = process.env.AI_SETTINGS_PATH || join(dataRoot, "settings.json");
 const libraryPath = process.env.SHICI_DATA_PATH || join(dataRoot, "library.json");
@@ -19,8 +19,26 @@ const envConfig = {
   baseUrl: envBaseUrl,
   apiKey: process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "",
   model: process.env.AI_MODEL || process.env.OPENAI_MODEL || "",
+  reasoningEffort: process.env.AI_REASONING_EFFORT || "auto",
   allowNoKey: process.env.AI_ALLOW_NO_KEY === "1",
 };
+
+const reasoningEfforts = new Set(["auto", "none", "low", "medium", "high"]);
+const MAX_OUTPUT_TOKENS = 4_000;
+const CAPABILITY_TTL = 30 * 60_000;
+
+class ApiError extends Error {
+  constructor(message, status = 502) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function normalizeReasoningEffort(value) {
+  const effort = String(value || "").trim().toLowerCase();
+  return reasoningEfforts.has(effort) ? effort : "auto";
+}
 
 const mime = {
   ".css": "text/css; charset=utf-8",
@@ -39,7 +57,7 @@ const responseSchemas = {
       type: { type: "string" }, kind: { type: "string", enum: ["word", "word_list", "phrase", "sentence", "other"] },
       displayText: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" },
       meaning: { type: "string" }, context: { type: "string" },
-      words: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, pronunciation: { type: "string" }, meaning: { type: "string" } }, required: ["text", "pronunciation", "meaning"] } },
+      words: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, original: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" }, meaning: { type: "string" } }, required: ["text", "original", "correction", "pronunciation", "meaning"] } },
       usage: { type: "array", items: { type: "string" } },
       chunks: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, meaning: { type: "string" } }, required: ["text", "meaning"] } },
       memoryCue: { type: "string" },
@@ -58,6 +76,7 @@ let savedConfig = normalizeSavedConfig(await loadSavedConfig());
 let library = await loadLibrary();
 let libraryWrite = Promise.resolve();
 let librarySerialized = JSON.stringify(library);
+const providerCapabilities = new Map();
 
 async function loadSavedConfig() {
   try {
@@ -81,6 +100,8 @@ function normalizeSavedConfig(value = {}) {
       baseUrl: cleanText(provider?.baseUrl, 2_000),
       apiKey: cleanText(provider?.apiKey, 10_000),
       model: cleanText(provider?.model, 500),
+      reasoningEffort: normalizeReasoningEffort(provider?.reasoningEffort),
+      enableThinkingToggle: Boolean(provider?.enableThinkingToggle),
       allowNoKey: Boolean(provider?.allowNoKey),
     }));
     const activeProviderId = providers.some((provider) => provider.id === value.activeProviderId)
@@ -90,7 +111,7 @@ function normalizeSavedConfig(value = {}) {
   }
   if (value.baseUrl || value.model || value.apiKey) {
     const id = "default";
-    return { version: 2, activeProviderId: id, providers: [{ id, name: "默认 Provider", ...value }] };
+    return { version: 2, activeProviderId: id, providers: [{ ...value, id, name: "默认 Provider", reasoningEffort: normalizeReasoningEffort(value.reasoningEffort), enableThinkingToggle: Boolean(value.enableThinkingToggle) }] };
   }
   return { version: 2, activeProviderId: "", providers: [] };
 }
@@ -103,8 +124,58 @@ function wordParts(raw) {
   return String(raw || "").split(/[\n,，;；]+/).map((part) => part.trim()).filter(Boolean);
 }
 
+function normalizeToken(value) {
+  return String(value || "").toLocaleLowerCase().replace(/^[^\p{L}\p{N}'’]+|[^\p{L}\p{N}'’]+$/gu, "");
+}
+
+function editDistance(left, right) {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= right.length; j += 1) {
+      current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1));
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
+}
+
+function claimOriginal(originalParts, used, text, preferred = "") {
+  const findExact = (target) => originalParts.findIndex((part, index) => !used.has(index) && normalizeToken(part) === normalizeToken(target));
+  let index = preferred ? findExact(preferred) : -1;
+  if (index < 0) index = findExact(text);
+  if (index < 0) {
+    const target = normalizeToken(text);
+    let best = -1;
+    let bestDistance = 3;
+    originalParts.forEach((part, partIndex) => {
+      if (used.has(partIndex)) return;
+      const distance = editDistance(normalizeToken(part), target);
+      if (distance < bestDistance) { bestDistance = distance; best = partIndex; }
+    });
+    index = best;
+  }
+  if (index < 0) return "";
+  used.add(index);
+  return originalParts[index];
+}
+
+function normalizeWordCorrection(raw, text, correction) {
+  const supplied = cleanText(correction, 200);
+  if (supplied) {
+    const parts = supplied.split(/\s*(?:→|->)\s*/);
+    if (parts.length === 2 && normalizeToken(parts[0]) && normalizeToken(parts[1])) return `${normalizeToken(parts[0])} → ${normalizeToken(parts[1])}`;
+  }
+  const before = normalizeToken(raw);
+  const after = normalizeToken(text);
+  const inflection = before.endsWith("ed") && before.slice(0, -2) === after
+    || before.endsWith("ing") && before.slice(0, -3) === after
+    || before.endsWith("s") && before.slice(0, -1) === after;
+  return before && after && before !== after && !inflection && editDistance(before, after) <= 2 ? `${before} → ${after}` : "";
+}
+
 function isWordToken(value) {
-  return /^[\p{L}\p{M}][\p{L}\p{M}'’\-]*$/u.test(value);
+  return /^[\p{L}\p{M}][\p{L}\p{M}'’-]*$/u.test(value);
 }
 
 function inferKind(raw, supplied) {
@@ -251,7 +322,9 @@ function saveLibrary(change) {
 }
 
 function normalizeApiBase(value) {
-  const url = new URL(String(value || "").trim());
+  let url;
+  try { url = new URL(String(value || "").trim()); }
+  catch { throw new ApiError("Base URL 格式不正确", 400); }
   if (!["http:", "https:"].includes(url.protocol)) throw new Error("Base URL 仅支持 http 或 https");
   if (url.username || url.password) throw new Error("请勿在 Base URL 中包含账号或密钥");
   url.search = "";
@@ -269,6 +342,8 @@ function resolveConfig(overrides = {}) {
   const providerBaseUrl = provider?.baseUrl ? normalizeApiBase(provider.baseUrl) : "";
   const baseMatchesProvider = !provider || !Object.hasOwn(overrides, "baseUrl") || baseUrl === providerBaseUrl;
   const model = String(overrides.model ?? provider?.model ?? envConfig.model).trim();
+  const reasoningEffort = normalizeReasoningEffort(overrides.reasoningEffort ?? provider?.reasoningEffort ?? envConfig.reasoningEffort);
+  const enableThinkingToggle = Boolean(overrides.enableThinkingToggle ?? provider?.enableThinkingToggle ?? false);
   const allowNoKey = Boolean(overrides.allowNoKey ?? provider?.allowNoKey ?? envConfig.allowNoKey);
   let apiKey;
   if (Object.hasOwn(overrides, "apiKey") && String(overrides.apiKey).trim()) apiKey = String(overrides.apiKey).trim();
@@ -276,7 +351,7 @@ function resolveConfig(overrides = {}) {
   else if (provider && baseMatchesProvider && Object.hasOwn(provider, "apiKey")) apiKey = provider.apiKey;
   else apiKey = envConfig.apiKey;
 
-  if (!["responses", "compatible"].includes(apiStyle)) throw new Error("不支持的 API 方式");
+  if (!["responses", "compatible"].includes(apiStyle)) throw new ApiError("API 方式只能是 Responses 或 Compatible", 400);
   return {
     apiStyle,
     providerId: provider?.id || "",
@@ -284,6 +359,8 @@ function resolveConfig(overrides = {}) {
     baseUrl,
     apiKey,
     model,
+    reasoningEffort,
+    enableThinkingToggle,
     allowNoKey,
     configured: Boolean(baseUrl && model && (apiKey || allowNoKey)),
     credentialsReady: Boolean(baseUrl && (apiKey || allowNoKey)),
@@ -299,12 +376,14 @@ function publicConfig(config = resolveConfig()) {
       const item = resolveConfig({ providerId: provider.id });
       return {
         id: provider.id, name: provider.name, apiStyle: item.apiStyle, baseUrl: item.baseUrl,
-        model: item.model, allowNoKey: item.allowNoKey, hasApiKey: Boolean(item.apiKey), configured: item.configured,
+        model: item.model, reasoningEffort: item.reasoningEffort, allowNoKey: item.allowNoKey, hasApiKey: Boolean(item.apiKey), configured: item.configured,
+        enableThinkingToggle: item.enableThinkingToggle,
       };
     }),
     apiStyle: config.apiStyle,
     baseUrl: config.baseUrl,
     model: config.model,
+    reasoningEffort: config.reasoningEffort,
     allowNoKey: config.allowNoKey,
     hasApiKey: Boolean(config.apiKey),
     configured: config.configured,
@@ -319,6 +398,8 @@ async function saveConfig(body) {
   const apiStyle = body.apiStyle === "compatible" ? "compatible" : "responses";
   const baseUrl = normalizeApiBase(body.baseUrl);
   const model = String(body.model || "").trim();
+  const reasoningEffort = normalizeReasoningEffort(body.reasoningEffort);
+  const enableThinkingToggle = Boolean(body.enableThinkingToggle);
   const name = cleanText(body.name, 80) || new URL(baseUrl).host;
   const allowNoKey = Boolean(body.allowNoKey);
   const apiKeyInput = String(body.apiKey || "").trim();
@@ -326,7 +407,7 @@ async function saveConfig(body) {
   if (!model) throw new Error("请填写或选择模型 ID");
   if (!apiKey && !allowNoKey) throw new Error("请填写 API Key，或允许无密钥服务");
 
-  const next = { id: providerId, name, apiStyle, baseUrl, model, allowNoKey, apiKey };
+  const next = { id: providerId, name, apiStyle, baseUrl, model, reasoningEffort, enableThinkingToggle, allowNoKey, apiKey };
   const providers = savedConfig.providers.filter((provider) => provider.id !== providerId);
   providers.push(next);
   savedConfig = { version: 2, activeProviderId: providerId, providers };
@@ -363,7 +444,11 @@ async function readJson(request) {
     if (size > 5_000_000) throw new Error("请求内容过长");
     parts.push(part);
   }
-  return JSON.parse(Buffer.concat(parts).toString("utf8") || "{}");
+  try {
+    return JSON.parse(Buffer.concat(parts).toString("utf8") || "{}");
+  } catch {
+    throw new ApiError("请求 JSON 格式不正确", 400);
+  }
 }
 
 function compactPayload(body) {
@@ -402,9 +487,10 @@ async function fetchJson(url, options, signal) {
       try { data = contentType.includes("text/event-stream") ? parseSse(raw) : (raw ? JSON.parse(raw) : {}); }
       catch { data = { raw }; }
       if (!response.ok) {
-        const error = new Error(data.error?.message || data.message || `上游请求失败 (${response.status})`);
-        error.status = response.status;
-        throw error;
+        throw new ApiError(data.error?.message || data.message || `上游请求失败 (${response.status})`, response.status);
+      }
+      if (data?.status === "incomplete" && data.incomplete_details?.reason === "max_output_tokens") {
+        throw new ApiError("模型输出被推理过程耗尽，请提高输出上限或降低推理程度", 502);
       }
       return data;
     } catch (error) {
@@ -438,8 +524,35 @@ function parseModelJson(value) {
   const text = Array.isArray(value)
     ? value.map((part) => part.text || part.content || "").join("")
     : String(value || "");
-  const clean = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  return JSON.parse(clean);
+  let clean = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  clean = clean.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  const start = clean.search(/[{[]/);
+  if (start > 0) clean = clean.slice(start);
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  let end = -1;
+  for (let index = 0; index < clean.length; index += 1) {
+    const char = clean[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') { quoted = true; continue; }
+    if (char === "{" || char === "[") depth += 1;
+    if (char === "}" || char === "]") {
+      depth -= 1;
+      if (depth === 0) { end = index + 1; break; }
+    }
+  }
+  if (end > 0) clean = clean.slice(0, end);
+  try {
+    return JSON.parse(clean);
+  } catch {
+    throw new ApiError("模型返回了无法解析的 JSON，请降低推理程度或检查模型格式兼容性", 502);
+  }
 }
 
 function responseOutputText(data) {
@@ -453,21 +566,52 @@ function responseOutputText(data) {
 
 async function explainWithAI(payload, config, signal) {
   const schema = responseSchemas[payload.mode === "followup" ? "followup" : "new"];
-  const request = (structured) => config.apiStyle === "responses"
+  const capabilityKey = [config.providerId, config.apiStyle, config.baseUrl, config.model, config.enableThinkingToggle].join("|");
+  const cachedValue = providerCapabilities.get(capabilityKey);
+  const cached = cachedValue && Date.now() - cachedValue.at < CAPABILITY_TTL ? cachedValue : {};
+  const hasReasoning = config.reasoningEffort !== "auto";
+  const supportsChatTemplateKwargs = config.enableThinkingToggle;
+  const request = (structured, includeReasoning = true) => config.apiStyle === "responses"
     ? fetchJson(`${config.baseUrl}/responses`, {
       method: "POST", headers: requestHeaders(config),
-      body: JSON.stringify({ model: config.model, instructions: systemPrompt, input: JSON.stringify(payload), max_output_tokens: 1_200, ...(structured ? { stream: true, text: { format: { type: "json_schema", name: payload.mode === "followup" ? "shici_followup" : "shici_entry", strict: true, schema } } } : {}) }),
+      body: JSON.stringify({ model: config.model, instructions: systemPrompt, input: JSON.stringify(payload), max_output_tokens: MAX_OUTPUT_TOKENS, ...(includeReasoning && hasReasoning ? { reasoning: { effort: config.reasoningEffort } } : {}), ...(structured ? { text: { format: { type: "json_schema", name: payload.mode === "followup" ? "shici_followup" : "shici_entry", strict: true, schema } } } : {}) }),
     }, signal).then((data) => parseModelJson(responseOutputText(data)))
     : fetchJson(`${config.baseUrl}/chat/completions`, {
       method: "POST", headers: requestHeaders(config),
-      body: JSON.stringify({ model: config.model, temperature: 0.2, max_tokens: 1_200, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: JSON.stringify(payload) }], ...(structured ? { stream: true, response_format: { type: "json_schema", json_schema: { name: payload.mode === "followup" ? "shici_followup" : "shici_entry", strict: true, schema } } } : {}) }),
+      body: JSON.stringify({ model: config.model, temperature: 0.2, max_tokens: MAX_OUTPUT_TOKENS, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: JSON.stringify(payload) }], ...(includeReasoning && hasReasoning ? { reasoning_effort: config.reasoningEffort, ...(supportsChatTemplateKwargs ? { chat_template_kwargs: { enable_thinking: config.reasoningEffort !== "none" } } : {}) } : {}), ...(structured ? { response_format: { type: "json_schema", json_schema: { name: payload.mode === "followup" ? "shici_followup" : "shici_entry", strict: true, schema } } } : {}) }),
     }, signal).then((data) => parseModelJson(data.choices?.[0]?.message?.content));
-  try {
-    return await request(true);
-  } catch (error) {
-    if (error.status !== 400) throw error;
-    return request(false);
+  const attempts = [];
+  const addAttempt = (structured, includeReasoning) => {
+    if (!attempts.some((attempt) => attempt[0] === structured && attempt[1] === includeReasoning)) attempts.push([structured, includeReasoning]);
+  };
+  if (cached.structured !== false) {
+    if (hasReasoning && cached.reasoning !== false) addAttempt(true, true);
+    addAttempt(true, false);
   }
+  if (hasReasoning && cached.reasoning !== false) addAttempt(false, true);
+  addAttempt(false, false);
+  let lastError;
+  let structuredCapabilityError = false;
+  let reasoningCapabilityError = false;
+  for (const [structured, includeReasoning] of attempts) {
+    try {
+      const result = await request(structured, includeReasoning);
+      providerCapabilities.set(capabilityKey, {
+        structured: structured ? true : structuredCapabilityError ? false : cached.structured,
+        ...(hasReasoning && includeReasoning ? { reasoning: true } : hasReasoning && reasoningCapabilityError ? { reasoning: false } : cached.reasoning === undefined ? {} : { reasoning: cached.reasoning }),
+        at: Date.now(),
+      });
+      return result;
+    } catch (error) {
+      if (error.status !== 400) throw error;
+      const message = String(error.message || "").toLowerCase();
+      const genericCapabilityError = /unsupported|unrecognized|unknown parameter|invalid.*parameter/.test(message);
+      structuredCapabilityError ||= genericCapabilityError || /response_format|json_schema/.test(message);
+      reasoningCapabilityError ||= genericCapabilityError || /reasoning|chat_template|thinking/.test(message);
+      lastError = error;
+    }
+  }
+  throw lastError || new ApiError("上游不支持当前请求格式", 400);
 }
 
 async function listModels(body) {
@@ -532,12 +676,62 @@ function explainInDemo(payload) {
 async function createEntry(body, signal) {
   const payload = compactPayload({ mode: "new", text: body.text, source: body.source });
   if (!payload.text.trim()) throw new Error("请输入一个语言片段");
+  const forceNew = body.forceNew === true;
   const normalized = payload.text.trim().toLocaleLowerCase();
   const duplicate = library.entries.find((entry) => [entry.raw, entry.displayText].some((value) => value.trim().toLocaleLowerCase() === normalized));
-  if (duplicate) return { entry: duplicate, duplicate: true, demo: false };
+  if (duplicate && !forceNew) return { entry: duplicate, entries: [duplicate], duplicate: true, demo: false };
+  if (payload.kindHint === "word_list" && !forceNew) {
+    const parts = wordParts(payload.text);
+    const hits = parts.map((part) => library.entries.find((entry) => [entry.raw, entry.displayText].some((value) => value.trim().toLocaleLowerCase() === part.toLocaleLowerCase())));
+    if (parts.length > 1 && hits.every(Boolean)) return { entry: hits[0], entries: hits, split: true, duplicate: true, createdCount: 0, reusedCount: hits.length, demo: false };
+  }
   const config = resolveConfig();
   const result = config.configured ? await explainWithAI(payload, config, signal) : explainInDemo(payload);
   signal?.throwIfAborted();
+  const splitWords = result.kind === "word_list"
+    ? (Array.isArray(result.words) && result.words.length > 1 ? result.words : wordParts(payload.text).map((text) => ({ text })))
+      .filter((word) => cleanText(word?.text, 200))
+    : [];
+  if (splitWords.length > 1) {
+    const createdAt = Date.now();
+    const originalParts = wordParts(payload.text);
+    const used = new Set();
+    const entries = splitWords.map((word) => {
+      const text = cleanText(word?.text, 200);
+      const raw = cleanText(claimOriginal(originalParts, used, text, word?.original) || text, 200);
+      const meaning = cleanText(word?.meaning, 1_000) || cleanText(result.meaning, 2_000) || "暂时没有解释";
+      return cleanEntry({
+        id: randomUUID(), raw, displayText: text, kind: "word",
+        words: [{ text, pronunciation: cleanText(word?.pronunciation, 500), meaning }],
+        correction: normalizeWordCorrection(raw, text, word?.correction),
+        pronunciation: cleanText(word?.pronunciation, 500), meaning,
+        context: "", usage: [], chunks: [], source: payload.source,
+        status: "review", starred: false, createdAt, updatedAt: createdAt,
+        baseConclusion: meaning, conclusion: meaning, review: { dueAt: createdAt + 10 * 60_000 }, thread: [],
+      });
+    }).filter(Boolean);
+    const returned = [];
+    const createdEntries = [];
+    const seen = new Map();
+    let reusedCount = 0;
+    await saveLibrary((libraryEntries) => {
+      for (const entry of entries) {
+        const rawKey = entry.raw.toLocaleLowerCase();
+        const displayKey = entry.displayText.toLocaleLowerCase();
+        const duplicate = forceNew ? null : seen.get(displayKey) || libraryEntries.find((item) => [item.raw, item.displayText].some((value) => [rawKey, displayKey].includes(value.trim().toLocaleLowerCase())));
+        if (duplicate) {
+          returned.push(duplicate);
+          reusedCount += 1;
+        } else {
+          returned.push(entry);
+          createdEntries.push(entry);
+          seen.set(displayKey, entry);
+        }
+      }
+      libraryEntries.unshift(...createdEntries);
+    });
+    return { entry: returned[0], entries: returned, split: true, duplicate: reusedCount > 0, createdCount: createdEntries.length, reusedCount, demo: Boolean(result.demo) };
+  }
   const createdAt = Date.now();
   const entry = cleanEntry({
     id: randomUUID(),
@@ -561,8 +755,13 @@ async function createEntry(body, signal) {
     review: { dueAt: createdAt + 10 * 60_000 },
     thread: [],
   });
-  await saveLibrary((entries) => entries.unshift(entry));
-  return { entry, demo: Boolean(result.demo) };
+  const saved = await saveLibrary((entries) => {
+    const duplicate = forceNew ? null : entries.find((item) => [item.raw, item.displayText].some((value) => value.trim().toLocaleLowerCase() === payload.text.trim().toLocaleLowerCase()));
+    if (duplicate) return { entry: duplicate, entries: [duplicate], duplicate: true, demo: false };
+    entries.unshift(entry);
+    return { entry, entries: [entry], demo: Boolean(result.demo) };
+  });
+  return saved;
 }
 
 async function addFollowup(id, body, signal) {
@@ -620,7 +819,16 @@ async function updateEntry(id, body) {
   });
 }
 
-function scheduleReview(review, grade, now = Date.now()) {
+function stableJitter(id) {
+  let hash = 2_166_136_261;
+  for (const byte of Buffer.from(String(id || ""))) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return 0.9 + ((hash >>> 0) % 21) / 100;
+}
+
+function scheduleReview(review, grade, id, now = Date.now()) {
   let ease = review.ease;
   let repetitions = review.repetitions;
   let lapses = review.lapses;
@@ -644,7 +852,7 @@ function scheduleReview(review, grade, now = Date.now()) {
     repetitions += 1;
   }
 
-  if (repetitions > 1 && grade !== "again") intervalDays *= 0.9 + (Math.floor(now / 60_000) % 21) / 100;
+  if (repetitions > 1 && grade !== "again") intervalDays *= stableJitter(id);
   intervalDays = Math.round(intervalDays * 100) / 100;
   return {
     dueAt: now + intervalDays * 86_400_000,
@@ -663,7 +871,7 @@ async function gradeEntry(id, body) {
   return saveLibrary((entries) => {
     const entry = entries.find((item) => item.id === id);
     if (!entry) throw new Error("没有找到这个片段");
-    entry.review = scheduleReview(entry.review, grade);
+    entry.review = scheduleReview(entry.review, grade, id);
     entry.status = grade === "again" ? "review" : "learned";
     entry.updatedAt = Date.now();
     return entry;
@@ -707,7 +915,8 @@ function trustedApiRequest(request) {
 
 function errorStatus(error) {
   const message = error?.message || "";
-  if (error instanceof SyntaxError || /请输入|格式不正确|Base URL|不支持|请.*填写|没有找到/.test(message)) {
+  if (Number.isInteger(error?.status)) return error.status;
+  if (/请输入|格式不正确|Base URL|请.*填写|没有找到/.test(message)) {
     return /没有找到/.test(message) ? 404 : 400;
   }
   return 502;
@@ -753,7 +962,7 @@ async function handleApi(request, response, pathname) {
       return true;
     }
     if (pathname === "/api/entries" && request.method === "POST") {
-      sendJson(response, 201, await createEntry(await readJson(request), cancellation.signal));
+      sendJson(response, 200, await createEntry(await readJson(request), cancellation.signal));
       return true;
     }
     const followupMatch = pathname.match(/^\/api\/entries\/([\w-]+)\/followups$/);
