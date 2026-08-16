@@ -510,7 +510,7 @@ function renderDetailPanel() {
               <div><dt>复习</dt><dd>${review.repetitions || 0} 次</dd></div>
               <div><dt>下次</dt><dd>${dueLabel(entry)}</dd></div>
               <div><dt>状态</dt><dd>${review.leech ? "顽固词" : entry.status === "review" ? "待复习" : "已学习"}</dd></div>
-              <div><dt>难度</dt><dd>${Number(review.ease || 2.5).toFixed(1)}</dd></div>
+              <div><dt>难度</dt><dd>${Number(entry.difficulty || 3).toFixed(1)} / 5</dd></div>
             </dl>
           </section>
         </main>
@@ -547,7 +547,7 @@ function openEntryDetail(entry) {
 
 function renderEntry(entry) {
   const selected = state.selectedEntryId === entry.id;
-  const meta = entry.pronunciation || entry.meaning || kindLabels[entry.kind] || "语言片段";
+  const meta = entry.meaning || kindLabels[entry.kind] || "语言片段";
   return `<article class="entry-card ${selected ? "selected" : ""} ${isDue(entry) ? "due" : ""}" data-entry-id="${entry.id}">
     <button class="entry-row" type="button" data-action="open-detail" data-id="${entry.id}" aria-pressed="${selected}">
       <span class="entry-check" aria-hidden="true"></span>
@@ -1164,18 +1164,22 @@ async function importLibraryFile(event) {
     const parsed = JSON.parse(await file.text());
     const entries = Array.isArray(parsed) ? parsed : parsed?.entries;
     if (!Array.isArray(entries)) throw new Error("JSON 中没有 entries 数组");
-    const result = await requestJson("/api/entries", {
-      method: "PUT",
+    const result = await requestJson("/api/entries/import", {
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ entries }),
     });
     state.entries = result.entries || [];
-    state.selectedEntryId = state.entries[0]?.id || null;
+    state.selectedEntryId = state.entries.find((entry) => entry.id === state.selectedEntryId)?.id || state.entries[0]?.id || null;
     state.view = "all";
     state.sourceFilter = "";
     elements.dialog.close();
     render();
-    toast(`已导入 ${state.entries.length} 条片段`);
+    const parts = [`已追加 ${result.importedCount || 0} 条`];
+    if (result.skippedCount) parts.push(`跳过 ${result.skippedCount} 条重复`);
+    if (result.invalidCount) parts.push(`忽略 ${result.invalidCount} 条无效记录`);
+    if (result.truncatedCount) parts.push(`超出上限 ${result.truncatedCount} 条`);
+    toast(parts.join("，"));
   } catch (error) {
     toast(error.message || "导入失败");
   }
@@ -1318,4 +1322,4 @@ load().catch((error) => toast(error.message || "无法读取本地数据")).fina
   state.busy = false;
   render();
 });
-if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=23").catch(() => {});
+if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=26").catch(() => {});

@@ -249,10 +249,11 @@
       </form>
       <div class="settings-list data-settings">
         <div class="setting-row"><div><strong>本地片段库</strong><p>解释、来源、复习状态与追问均保存在本机</p></div><span id="settings-count">0</span></div>
+        <p class="field-help import-help">批量文件会追加到现有词库，重复内容自动跳过。格式见项目中的 docs/import-prompt.md。</p>
       </div>
       <div class="dialog-actions">
         <button class="secondary-button" type="button" data-action="export"><i data-lucide="download"></i>导出 JSON</button>
-        <button class="secondary-button" type="button" data-action="import"><i data-lucide="upload"></i>导入 JSON</button>
+        <button class="secondary-button" type="button" data-action="import"><i data-lucide="upload"></i>追加导入 JSON</button>
         <input id="import-json" type="file" accept="application/json,.json" hidden />
         <button class="secondary-button danger" type="button" data-action="reset"><i data-lucide="rotate-ccw"></i>恢复演示数据</button>
       </div>
@@ -272,6 +273,6 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script src="/vendor/lucide.min.js?v=19"></script>
-    <script type="module" src="/app.js?v=19"></script>
+    <script type="module" src="/app.js?v=26"></script>
   </body>
 </html>

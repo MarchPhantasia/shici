@@ -2,6 +2,24 @@
   "name": "shici",
   "version": "0.3.2",
   "private": true,
+  "description": "拾词 — 面向碎片化语言输入的本地优先学习工具：随手捕捉任意语言片段，由任意 OpenAI 兼容模型解释，并按自适应节奏复习。",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MarchPhantasia/shici.git"
+  },
+  "homepage": "https://github.com/MarchPhantasia/shici#readme",
+  "bugs": {
+    "url": "https://github.com/MarchPhantasia/shici/issues"
+  },
+  "keywords": [
+    "language-learning",
+    "spaced-repetition",
+    "vocabulary",
+    "local-first",
+    "tauri",
+    "openai-compatible"
+  ],
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
@@ -9,8 +27,9 @@
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build",
-    "check": "node --check server.mjs && node --check public/app.js && node --check test/smoke.mjs && npm run lint",
+    "check": "node --check server.mjs && node --check public/app.js && node --check test/smoke.mjs && npm run lint && npm run lint:encoding",
     "lint": "eslint server.mjs public/app.js scripts/*.mjs test/smoke.mjs",
+    "lint:encoding": "node --input-type=module -e \"import{readFileSync}from'node:fs';const files=['README.md','TODO.md','system-prompt.txt','server.mjs','public/app.js','public/index.html','docs/import-prompt.md','docs/import-format.schema.json'];const bad=files.filter(p=>readFileSync(p,'utf8').includes('\\\\uFFFD'));if(bad.length){console.error('发现替换字符 U+FFFD:',bad.join(', '));process.exit(1)}\"",
     "test": "node test/smoke.mjs",
     "ci": "npm run check && npm test && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo test --manifest-path src-tauri/Cargo.toml --no-default-features && cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --release && cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features -- -D warnings"
   },

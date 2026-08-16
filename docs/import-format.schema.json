@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shici Import",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "version", "entries"],
+  "properties": {
+    "format": { "const": "shici-import" },
+    "version": { "const": 1 },
+    "entries": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw", "displayText", "kind", "correction", "pronunciation",
+        "meaning", "context", "usage", "chunks", "source", "difficulty", "words"
+      ],
+      "properties": {
+        "raw": { "type": "string", "minLength": 1 },
+        "displayText": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["word", "phrase", "sentence", "other"] },
+        "correction": { "type": "string" },
+        "pronunciation": { "type": "string" },
+        "meaning": { "type": "string" },
+        "context": { "type": "string" },
+        "usage": {
+          "type": "array",
+          "maxItems": 3,
+          "items": { "type": "string" }
+        },
+        "chunks": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text", "meaning"],
+            "properties": {
+              "text": { "type": "string" },
+              "meaning": { "type": "string" }
+            }
+          }
+        },
+        "source": {
+          "enum": ["", "日常", "阅读", "影视", "工作", "游戏", "网页", "聊天", "其他"]
+        },
+        "difficulty": { "type": "number", "minimum": 1, "maximum": 5 },
+        "words": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text", "original", "correction", "pronunciation", "meaning"],
+            "properties": {
+              "text": { "type": "string" },
+              "original": { "type": "string" },
+              "correction": { "type": "string" },
+              "pronunciation": { "type": "string" },
+              "meaning": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

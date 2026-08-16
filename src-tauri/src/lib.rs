@@ -236,6 +236,97 @@ fn is_word_token(value: &str) -> bool {
         && chars.all(|char| char.is_alphabetic() || matches!(char, '\'' | '’' | '-'))
 }
 
+fn capitalize_word(value: &str) -> String {
+    if value != value.to_lowercase() {
+        return value.to_string();
+    }
+    let mut chars = value.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+fn normalize_difficulty(value: Option<&Value>) -> Option<f64> {
+    let difficulty = number(value, -1.0);
+    (1.0..=5.0)
+        .contains(&difficulty)
+        .then(|| (difficulty * 10.0).round() / 10.0)
+}
+
+fn estimate_difficulty(
+    raw: &str,
+    display_text: &str,
+    kind: &str,
+    pronunciation: &str,
+    review: &Value,
+) -> f64 {
+    let fragment = if display_text.is_empty() {
+        raw
+    } else {
+        display_text
+    };
+    let letters = fragment
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .count();
+    let word_count = fragment
+        .split_whitespace()
+        .filter(|word| !word.is_empty())
+        .count();
+    let mut difficulty = match kind {
+        "sentence" => 3.4,
+        "phrase" => 2.8,
+        "word_list" => 3.0,
+        _ => 2.1,
+    };
+    if kind == "word" {
+        difficulty += (letters.saturating_sub(5) as f64 * 0.12).min(1.3);
+        let mut consonants = 0;
+        for character in fragment.chars() {
+            if character.is_alphabetic()
+                && !matches!(
+                    character.to_ascii_lowercase(),
+                    'a' | 'e' | 'i' | 'o' | 'u' | 'y'
+                )
+            {
+                consonants += 1;
+            } else {
+                consonants = 0;
+            }
+            if consonants >= 3 {
+                difficulty += 0.25;
+                break;
+            }
+        }
+    } else {
+        difficulty += ((word_count.saturating_sub(3) as f64) * 0.12).min(0.9);
+    }
+    if pronunciation.chars().count() > 18 {
+        difficulty += 0.2;
+    }
+    difficulty += (integer(review.get("lapses"), 0) as f64 * 0.2).min(0.8);
+    difficulty -= (integer(review.get("repetitions"), 0) as f64 * 0.05).min(0.5);
+    match text(review.get("lastGrade"), 12).as_str() {
+        "again" => difficulty += 0.4,
+        "hard" => difficulty += 0.2,
+        "easy" => difficulty -= 0.25,
+        _ => {}
+    }
+    (difficulty.clamp(1.0, 5.0) * 10.0).round() / 10.0
+}
+
+fn adjust_difficulty(value: Option<&Value>, grade: &str) -> f64 {
+    let delta = match grade {
+        "again" => 0.4,
+        "hard" => 0.2,
+        "good" => -0.1,
+        "easy" => -0.25,
+        _ => 0.0,
+    };
+    ((normalize_difficulty(value).unwrap_or(3.0) + delta).clamp(1.0, 5.0) * 10.0).round() / 10.0
+}
+
 fn infer_kind(raw: &str, supplied: &str) -> String {
     if ["word", "word_list", "phrase", "sentence", "other"].contains(&supplied) {
         return supplied.into();
@@ -399,6 +490,9 @@ fn clean_entry(value: &Value) -> Option<Value> {
         pronunciation.clear();
     }
     let kind = infer_kind(&display_text, &text(object.get("kind"), 24));
+    if kind == "word" {
+        display_text = capitalize_word(&display_text);
+    }
     let meaning = text(object.get("meaning"), 5_000);
     let mut words = object
         .get("words")
@@ -408,7 +502,7 @@ fn clean_entry(value: &Value) -> Option<Value> {
         .take(50)
         .filter_map(|word| {
             let word = word.as_object()?;
-            let word_text = text(word.get("text"), 200);
+            let word_text = capitalize_word(&text(word.get("text"), 200));
             if word_text.is_empty() {
                 None
             } else {
@@ -436,6 +530,11 @@ fn clean_entry(value: &Value) -> Option<Value> {
     } else {
         pronunciation
     };
+    let context = text(object.get("context"), 5_000);
+    let review = clean_review(object.get("review"), created_at, status);
+    let difficulty = normalize_difficulty(object.get("difficulty")).unwrap_or_else(|| {
+        estimate_difficulty(&raw, &display_text, &kind, &pronunciation, &review)
+    });
 
     Some(json!({
         "id": valid_id(object.get("id")),
@@ -446,8 +545,9 @@ fn clean_entry(value: &Value) -> Option<Value> {
         "correction": correction,
         "pronunciation": pronunciation,
         "meaning": meaning,
-        "context": text(object.get("context"), 5_000),
+        "context": context,
         "usage": usage,
+        "difficulty": difficulty,
         "chunks": chunks,
         "source": text(object.get("source"), 24),
         "status": status,
@@ -456,7 +556,7 @@ fn clean_entry(value: &Value) -> Option<Value> {
         "updatedAt": number(object.get("updatedAt"), created_at),
         "baseConclusion": text(object.get("baseConclusion").or_else(|| object.get("meaning")).or_else(|| object.get("conclusion")), 2_000),
         "conclusion": text(object.get("conclusion"), 2_000),
-        "review": clean_review(object.get("review"), created_at, status),
+        "review": review,
         "thread": thread
     }))
 }
@@ -892,7 +992,7 @@ impl Backend {
             let entries = split_words
                 .into_iter()
                 .filter_map(|word| {
-                    let word_text = text(word.get("text"), 200);
+                    let word_text = capitalize_word(&text(word.get("text"), 200));
                     if word_text.is_empty() {
                         return None;
                     }
@@ -908,11 +1008,31 @@ impl Backend {
                             value
                         }
                     };
+                    let context = {
+                        let value = text(word.get("context"), 2_000);
+                        if value.is_empty() {
+                            text(result.get("context"), 2_000)
+                        } else {
+                            value
+                        }
+                    };
+                    let usage = word
+                        .get("usage")
+                        .and_then(Value::as_array)
+                        .filter(|items| !items.is_empty())
+                        .cloned()
+                        .or_else(|| result.get("usage").and_then(Value::as_array).cloned())
+                        .unwrap_or_default();
+                    let difficulty = word
+                        .get("difficulty")
+                        .cloned()
+                        .or_else(|| result.get("difficulty").cloned())
+                        .unwrap_or(Value::Null);
                     clean_entry(&json!({
                         "id":Uuid::new_v4().to_string(), "raw":raw, "kind":"word", "words":[{
                             "text":word_text, "pronunciation":pronunciation, "meaning":meaning
                         }], "displayText":word_text, "correction":correction, "pronunciation":pronunciation,
-                        "meaning":meaning, "context":"", "usage":[], "chunks":[],
+                        "meaning":meaning, "context":context, "usage":usage, "difficulty":difficulty, "chunks":[],
                         "source":source.clone(), "status":"review", "starred":false, "createdAt":created, "updatedAt":created,
                         "baseConclusion":meaning, "conclusion":meaning, "review":{"dueAt":created + 600_000.0}, "thread":[]
                     }))
@@ -958,7 +1078,7 @@ impl Backend {
             "displayText": text(result.get("displayText"), 5_000),
             "correction": text(result.get("correction"), 500), "pronunciation": text(result.get("pronunciation"), 500),
             "meaning": text(result.get("meaning"), 5_000), "context": text(result.get("context"), 5_000),
-            "usage": result.get("usage").cloned().unwrap_or(json!([])), "chunks": result.get("chunks").cloned().unwrap_or(json!([])),
+            "usage": result.get("usage").cloned().unwrap_or(json!([])), "difficulty": result.get("difficulty").cloned().unwrap_or(Value::Null), "chunks": result.get("chunks").cloned().unwrap_or(json!([])),
             "source": source, "status":"review", "starred":false, "createdAt":created, "updatedAt":created,
             "baseConclusion": text(result.get("memoryCue").or_else(|| result.get("meaning")), 2_000),
             "conclusion": text(result.get("memoryCue").or_else(|| result.get("meaning")), 2_000),
@@ -1145,6 +1265,8 @@ impl Backend {
             .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
             .ok_or("没有找到这个片段")?;
         entry["review"] = schedule_review(&entry["review"], &grade, id);
+        let difficulty = adjust_difficulty(entry.get("difficulty"), &grade);
+        entry["difficulty"] = json!(difficulty);
         entry["status"] = json!(if grade == "again" {
             "review"
         } else {
@@ -1181,6 +1303,79 @@ impl Backend {
         Ok(self.library.clone())
     }
 
+    fn append_entries(&mut self, body: &Value) -> Result<Value, String> {
+        let source = body
+            .get("entries")
+            .and_then(Value::as_array)
+            .ok_or("片段数据格式不正确")?;
+        let source = source.iter().take(10_000);
+        let mut existing_keys = std::collections::HashSet::new();
+        let mut used_ids = std::collections::HashSet::new();
+        for entry in self.entries() {
+            for field in ["raw", "displayText"] {
+                if let Some(value) = entry.get(field).and_then(Value::as_str) {
+                    let key = value.trim().to_lowercase();
+                    if !key.is_empty() {
+                        existing_keys.insert(key);
+                    }
+                }
+            }
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                used_ids.insert(id.to_string());
+            }
+        }
+        let mut additions = Vec::new();
+        let mut skipped_count = 0;
+        let mut invalid_count = 0;
+        for value in source {
+            let Some(mut entry) = clean_entry(value) else {
+                invalid_count += 1;
+                continue;
+            };
+            let keys = ["raw", "displayText"]
+                .into_iter()
+                .filter_map(|field| entry.get(field).and_then(Value::as_str))
+                .map(|value| value.trim().to_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            if keys.iter().any(|key| existing_keys.contains(key)) {
+                skipped_count += 1;
+                continue;
+            }
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if used_ids.contains(&id) {
+                entry["id"] = json!(Uuid::new_v4().to_string());
+            }
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                used_ids.insert(id.to_string());
+            }
+            for key in keys {
+                existing_keys.insert(key);
+            }
+            additions.push(entry);
+        }
+        let truncated_count = body
+            .get("entries")
+            .and_then(Value::as_array)
+            .map_or(0, |entries| entries.len().saturating_sub(10_000));
+        let mut merged = additions.clone();
+        merged.extend(self.entries().iter().cloned());
+        self.library = json!({"version":2,"entries":merged});
+        self.save_library()?;
+        Ok(json!({
+            "version": 2,
+            "entries": self.entries(),
+            "importedCount": additions.len(),
+            "skippedCount": skipped_count,
+            "invalidCount": invalid_count,
+            "truncatedCount": truncated_count
+        }))
+    }
+
     async fn handle(
         &mut self,
         request: ApiRequest,
@@ -1202,6 +1397,9 @@ impl Backend {
         }
         if path == "/api/entries" && method == "PUT" {
             return Ok((200, self.replace_entries(&request.body)?));
+        }
+        if path == "/api/entries/import" && method == "POST" {
+            return Ok((200, self.append_entries(&request.body)?));
         }
         if path == "/api/entries" && method == "POST" {
             return Ok((200, self.create_entry(&request.body, cancellation).await?));
@@ -1501,10 +1699,10 @@ fn response_schema(payload: &Value) -> Value {
         json!({
             "name": "shici_entry",
             "schema": {"type":"object","additionalProperties":false,"properties":{
-                "type":{"type":"string"},"kind":{"type":"string","enum":["word","word_list","phrase","sentence","other"]},"displayText":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},
-                "words":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"original":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"}},"required":["text","original","correction","pronunciation","meaning"]}},
+                "type":{"type":"string"},"kind":{"type":"string","enum":["word","word_list","phrase","sentence","other"]},"displayText":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},"difficulty":{"type":"number","minimum":1,"maximum":5},
+                "words":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"original":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},"usage":{"type":"array","items":{"type":"string"}},"difficulty":{"type":"number","minimum":1,"maximum":5}},"required":["text","original","correction","pronunciation","meaning","context","usage","difficulty"]}},
                 "usage":{"type":"array","items":{"type":"string"}},"chunks":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"meaning":{"type":"string"}},"required":["text","meaning"]}},"memoryCue":{"type":"string"}
-            },"required":["type","kind","displayText","correction","pronunciation","meaning","context","words","usage","chunks","memoryCue"]}
+            },"required":["type","kind","displayText","correction","pronunciation","meaning","context","difficulty","words","usage","chunks","memoryCue"]}
         })
     }
 }
@@ -1989,6 +2187,29 @@ mod tests {
             normalize_word_correction("betta", "beta", "betta → beta"),
             "betta → beta"
         );
+    }
+
+    #[test]
+    fn words_are_capitalized_during_cleanup() {
+        let entry = clean_entry(&json!({
+            "raw":"sloppy", "kind":"word", "displayText":"sloppy", "meaning":"草率的",
+            "words":[{"text":"sloppy","pronunciation":"/test/","meaning":"草率的"}]
+        }))
+        .unwrap();
+        assert_eq!(entry["raw"], json!("sloppy"));
+        assert_eq!(entry["displayText"], json!("Sloppy"));
+        assert_eq!(entry["words"][0]["text"], json!("Sloppy"));
+    }
+
+    #[test]
+    fn capitalization_preserves_intentional_casing() {
+        assert_eq!(capitalize_word("apple"), "Apple");
+        assert_eq!(capitalize_word("iPhone"), "iPhone");
+        assert_eq!(capitalize_word("eBay"), "eBay");
+        assert_eq!(capitalize_word("macOS"), "macOS");
+        assert_eq!(capitalize_word("URL"), "URL");
+        assert_eq!(capitalize_word(""), "");
+        assert_eq!(capitalize_word("日本語"), "日本語");
     }
 
     #[test]

@@ -56,13 +56,13 @@ const responseSchemas = {
     properties: {
       type: { type: "string" }, kind: { type: "string", enum: ["word", "word_list", "phrase", "sentence", "other"] },
       displayText: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" },
-      meaning: { type: "string" }, context: { type: "string" },
-      words: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, original: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" }, meaning: { type: "string" } }, required: ["text", "original", "correction", "pronunciation", "meaning"] } },
+      meaning: { type: "string" }, context: { type: "string" }, difficulty: { type: "number", minimum: 1, maximum: 5 },
+      words: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, original: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" }, meaning: { type: "string" }, context: { type: "string" }, usage: { type: "array", items: { type: "string" } }, difficulty: { type: "number", minimum: 1, maximum: 5 } }, required: ["text", "original", "correction", "pronunciation", "meaning", "context", "usage", "difficulty"] } },
       usage: { type: "array", items: { type: "string" } },
       chunks: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, meaning: { type: "string" } }, required: ["text", "meaning"] } },
       memoryCue: { type: "string" },
     },
-    required: ["type", "kind", "displayText", "correction", "pronunciation", "meaning", "context", "words", "usage", "chunks", "memoryCue"],
+    required: ["type", "kind", "displayText", "correction", "pronunciation", "meaning", "context", "difficulty", "words", "usage", "chunks", "memoryCue"],
   },
   followup: {
     type: "object", additionalProperties: false,
@@ -178,6 +178,14 @@ function isWordToken(value) {
   return /^[\p{L}\p{M}][\p{L}\p{M}'’-]*$/u.test(value);
 }
 
+function capitalizeWord(value) {
+  const text = String(value || "");
+  if (text !== text.toLocaleLowerCase()) return text;
+  const letters = Array.from(text);
+  if (letters.length) letters[0] = letters[0].toLocaleUpperCase();
+  return letters.join("");
+}
+
 function inferKind(raw, supplied) {
   if (entryKinds.includes(supplied)) return supplied;
   const value = cleanText(raw);
@@ -201,6 +209,40 @@ function cleanReview(value = {}, createdAt, status) {
     lastReviewedAt: Math.max(0, Number(value.lastReviewedAt) || 0),
     lastGrade: ["again", "hard", "good", "easy"].includes(value.lastGrade) ? value.lastGrade : "",
   };
+}
+
+function normalizeDifficulty(value) {
+  const difficulty = Number(value);
+  return Number.isFinite(difficulty) && difficulty >= 1 && difficulty <= 5
+    ? Math.round(difficulty * 10) / 10
+    : null;
+}
+
+function estimateDifficulty(value = {}) {
+  const displayText = cleanText(value.displayText || value.raw);
+  const kind = value.kind || inferKind(displayText);
+  const letters = Array.from(displayText).filter((character) => /\p{L}/u.test(character)).length;
+  const wordCount = displayText.split(/\s+/).filter(Boolean).length;
+  let difficulty = kind === "sentence" ? 3.4 : kind === "phrase" ? 2.8 : kind === "word_list" ? 3 : 2.1;
+  if (kind === "word") {
+    difficulty += Math.min(1.3, Math.max(0, letters - 5) * 0.12);
+    if (/[bcdfghjklmnpqrstvwxyz]{3}/iu.test(displayText)) difficulty += 0.25;
+  } else {
+    difficulty += Math.min(0.9, Math.max(0, wordCount - 3) * 0.12);
+  }
+  if (cleanText(value.pronunciation, 500).length > 18) difficulty += 0.2;
+  const review = value.review || {};
+  difficulty += Math.min(0.8, Math.max(0, Number(review.lapses) || 0) * 0.2);
+  difficulty -= Math.min(0.5, Math.max(0, Number(review.repetitions) || 0) * 0.05);
+  if (review.lastGrade === "again") difficulty += 0.4;
+  if (review.lastGrade === "hard") difficulty += 0.2;
+  if (review.lastGrade === "easy") difficulty -= 0.25;
+  return Math.round(Math.min(5, Math.max(1, difficulty)) * 10) / 10;
+}
+
+function adjustDifficulty(value, grade) {
+  const delta = { again: 0.4, hard: 0.2, good: -0.1, easy: -0.25 }[grade] || 0;
+  return Math.round(Math.min(5, Math.max(1, (normalizeDifficulty(value) ?? 3) + delta)) * 10) / 10;
 }
 
 function migrateLegacyCorrection(raw, displayText, correction) {
@@ -230,15 +272,20 @@ function cleanEntry(value = {}) {
     pronunciation = "";
   }
   const kind = inferKind(displayText, value.kind);
+  if (kind === "word") displayText = capitalizeWord(displayText);
   const meaning = cleanText(value.meaning);
   let words = Array.isArray(value.words) ? value.words.slice(0, 50).map((word) => ({
-    text: cleanText(word?.text, 200),
+    text: capitalizeWord(cleanText(word?.text, 200)),
     pronunciation: cleanText(word?.pronunciation, 500),
     meaning: cleanText(word?.meaning, 1_000),
   })).filter((word) => word.text) : [];
   if (kind === "word" && !words.length) words = [{ text: displayText, pronunciation, meaning }];
   if (kind === "word_list" && !words.length) words = wordParts(displayText).map((text) => ({ text, pronunciation: "", meaning: "" }));
   const baseConclusion = cleanText(value.baseConclusion || value.meaning || value.conclusion, 2_000);
+  const context = cleanText(value.context);
+  const usage = Array.isArray(value.usage) ? value.usage.slice(0, 3).map((item) => cleanText(item, 1_000)).filter(Boolean) : [];
+  const review = cleanReview(value.review, createdAt, status);
+  const difficulty = normalizeDifficulty(value.difficulty) ?? estimateDifficulty({ raw, displayText, kind, pronunciation, meaning, context, usage, review });
   return {
     id: /^[\w-]{1,80}$/.test(String(value.id || "")) ? String(value.id) : randomUUID(),
     raw,
@@ -248,8 +295,9 @@ function cleanEntry(value = {}) {
     correction,
     pronunciation: pronunciation || (kind === "word" ? words[0]?.pronunciation || "" : ""),
     meaning,
-    context: cleanText(value.context),
-    usage: Array.isArray(value.usage) ? value.usage.slice(0, 3).map((item) => cleanText(item, 1_000)).filter(Boolean) : [],
+    context,
+    usage,
+    difficulty,
     chunks: Array.isArray(value.chunks) ? value.chunks.slice(0, 4).map((chunk) => ({
       text: cleanText(chunk?.text, 500),
       meaning: cleanText(chunk?.meaning, 1_000),
@@ -261,7 +309,7 @@ function cleanEntry(value = {}) {
     updatedAt: Number(value.updatedAt) || createdAt,
     baseConclusion,
     conclusion: cleanText(value.conclusion, 2_000),
-    review: cleanReview(value.review, createdAt, status),
+    review,
     thread: Array.isArray(value.thread) ? value.thread.map((turn) => ({
       id: /^[\w-]{1,80}$/.test(String(turn?.id || "")) ? String(turn.id) : randomUUID(),
       question: cleanText(turn?.question, 1_000),
@@ -279,7 +327,7 @@ async function loadLibrary() {
       version: 2,
       entries: Array.isArray(value.entries) ? value.entries.map(cleanEntry).filter((entry) => entry.raw) : [],
     };
-    if (value.version !== 2) await writePrivateJson(libraryPath, normalized);
+    if (JSON.stringify(value) !== JSON.stringify(normalized)) await writePrivateJson(libraryPath, normalized);
     return normalized;
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -697,15 +745,18 @@ async function createEntry(body, signal) {
     const originalParts = wordParts(payload.text);
     const used = new Set();
     const entries = splitWords.map((word) => {
-      const text = cleanText(word?.text, 200);
+      const text = capitalizeWord(cleanText(word?.text, 200));
       const raw = cleanText(claimOriginal(originalParts, used, text, word?.original) || text, 200);
       const meaning = cleanText(word?.meaning, 1_000) || cleanText(result.meaning, 2_000) || "暂时没有解释";
+      const context = cleanText(word?.context, 2_000) || cleanText(result.context, 2_000);
+      const usage = Array.isArray(word?.usage) && word.usage.length ? word.usage : result.usage;
       return cleanEntry({
         id: randomUUID(), raw, displayText: text, kind: "word",
         words: [{ text, pronunciation: cleanText(word?.pronunciation, 500), meaning }],
         correction: normalizeWordCorrection(raw, text, word?.correction),
         pronunciation: cleanText(word?.pronunciation, 500), meaning,
-        context: "", usage: [], chunks: [], source: payload.source,
+        context, usage, chunks: [], source: payload.source,
+        difficulty: normalizeDifficulty(word?.difficulty) ?? normalizeDifficulty(result.difficulty),
         status: "review", starred: false, createdAt, updatedAt: createdAt,
         baseConclusion: meaning, conclusion: meaning, review: { dueAt: createdAt + 10 * 60_000 }, thread: [],
       });
@@ -744,6 +795,7 @@ async function createEntry(body, signal) {
     meaning: result.meaning || "暂时没有解释",
     context: result.context,
     usage: result.usage,
+    difficulty: result.difficulty,
     chunks: result.chunks,
     source: payload.source,
     status: "review",
@@ -872,6 +924,7 @@ async function gradeEntry(id, body) {
     const entry = entries.find((item) => item.id === id);
     if (!entry) throw new Error("没有找到这个片段");
     entry.review = scheduleReview(entry.review, grade, id);
+    entry.difficulty = adjustDifficulty(entry.difficulty, grade);
     entry.status = grade === "again" ? "review" : "learned";
     entry.updatedAt = Date.now();
     return entry;
@@ -895,6 +948,49 @@ async function replaceEntries(body) {
     return current;
   });
   return { version: 2, entries: structuredClone(library.entries) };
+}
+
+function entryKeys(entry) {
+  return [entry.raw, entry.displayText]
+    .map((value) => String(value || "").trim().toLocaleLowerCase())
+    .filter(Boolean);
+}
+
+async function appendEntries(body) {
+  if (!Array.isArray(body.entries)) throw new Error("片段数据格式不正确");
+  const source = body.entries.slice(0, 10_000);
+  const existingKeys = new Set(library.entries.flatMap(entryKeys));
+  const usedIds = new Set(library.entries.map((entry) => entry.id));
+  const additions = [];
+  let skippedCount = 0;
+  let invalidCount = 0;
+  for (const value of source) {
+    const entry = cleanEntry(value);
+    if (!entry?.raw) {
+      invalidCount += 1;
+      continue;
+    }
+    const keys = entryKeys(entry);
+    if (keys.some((key) => existingKeys.has(key))) {
+      skippedCount += 1;
+      continue;
+    }
+    if (usedIds.has(entry.id)) entry.id = randomUUID();
+    usedIds.add(entry.id);
+    keys.forEach((key) => existingKeys.add(key));
+    additions.push(entry);
+  }
+  await saveLibrary((entries) => {
+    entries.unshift(...additions);
+  });
+  return {
+    version: 2,
+    entries: structuredClone(library.entries),
+    importedCount: additions.length,
+    skippedCount,
+    invalidCount,
+    truncatedCount: body.entries.length - source.length,
+  };
 }
 
 function trustedApiRequest(request) {
@@ -923,6 +1019,7 @@ function errorStatus(error) {
 }
 
 async function handleApi(request, response, pathname) {
+  if (!pathname.startsWith("/api/")) return false;
   if (!trustedApiRequest(request)) {
     sendJson(response, 403, { error: "Forbidden" });
     return true;
@@ -961,6 +1058,10 @@ async function handleApi(request, response, pathname) {
       sendJson(response, 200, await replaceEntries(await readJson(request)));
       return true;
     }
+    if (pathname === "/api/entries/import" && request.method === "POST") {
+      sendJson(response, 200, await appendEntries(await readJson(request)));
+      return true;
+    }
     if (pathname === "/api/entries" && request.method === "POST") {
       sendJson(response, 200, await createEntry(await readJson(request), cancellation.signal));
       return true;
@@ -993,11 +1094,8 @@ async function handleApi(request, response, pathname) {
     sendJson(response, errorStatus(error), { error: error.message || "请求失败" });
     return true;
   }
-  if (pathname.startsWith("/api/")) {
-    sendJson(response, 404, { error: "Not found" });
-    return true;
-  }
-  return false;
+  sendJson(response, 404, { error: "Not found" });
+  return true;
 }
 
 async function serveFile(response, pathname) {

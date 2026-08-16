@@ -55,10 +55,12 @@ const mock = createServer(async (request, response) => {
           ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "词形还原", context: "词表", words: [{ text: "run", original: "running", correction: "", pronunciation: "/rʌn/", meaning: "跑" }, { text: "jump", original: "jumped", correction: "", pronunciation: "/dʒʌmp/", meaning: "跳" }], usage: [], chunks: [], memoryCue: "" }
           : input.text === "cherry, apple, banana"
             ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "乱序词表", context: "词表", words: [{ text: "apple", pronunciation: "/ˈæpəl/", meaning: "苹果" }, { text: "banana", pronunciation: "/bəˈnænə/", meaning: "香蕉" }, { text: "cherry", pronunciation: "/ˈtʃeri/", meaning: "樱桃" }], usage: [], chunks: [], memoryCue: "" }
-            : input.text === "epsilon, zetta"
+      : input.text === "epsilon, zetta"
               ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "拼写纠错", context: "词表", words: [{ text: "epsilon", original: "epsilon", correction: "", pronunciation: "/ˈepsɪlɒn/", meaning: "艾普西隆" }, { text: "zeta", original: "zetta", correction: "zetta → zeta", pronunciation: "/ˈziːtə/", meaning: "泽塔" }], usage: [], chunks: [], memoryCue: "" }
+      : input.text === "iPhone"
+        ? { type: "entry", kind: "word", displayText: "iPhone", correction: "", pronunciation: "/ˈaɪfoʊn/", meaning: "苹果手机", context: "品牌名", words: [{ text: "iPhone", pronunciation: "/ˈaɪfoʊn/", meaning: "苹果手机" }], usage: [], chunks: [], memoryCue: "" }
       : input.kindHint === "word_list" || input.text.includes(",")
-        ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "两个独立单词", context: "词表", words: [{ text: "alpha", pronunciation: "/ˈælfə/", meaning: "阿尔法" }, { text: "beta", pronunciation: "/ˈbiːtə/", meaning: "贝塔" }], usage: [], chunks: [], memoryCue: "" }
+        ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "两个独立单词", context: "词表", words: [{ text: "alpha", pronunciation: "/ˈælfə/", meaning: "阿尔法", context: "希腊字母表的第一个字母。", usage: ["Alpha is the first letter. Alpha 是第一个字母。"], difficulty: 1.8 }, { text: "beta", pronunciation: "/ˈbiːtə/", meaning: "贝塔", context: "希腊字母表的第二个字母。", usage: ["The app is still in beta. 这个应用仍处于测试阶段。"], difficulty: 2.2 }], usage: [], chunks: [], memoryCue: "" }
         : input.kindHint === "phrase" || input.kindHint === "sentence"
           ? { type: "entry", kind: input.kindHint, displayText: input.text, correction: "", pronunciation: "", meaning: "保持原片段含义", context: "短语或句子", words: [], usage: [], chunks: [], memoryCue: "" }
         : { type: "entry", kind: "word", displayText: input.text, correction: "", pronunciation: "/test/", meaning: "响应成功", context: "Responses", words: [{ text: input.text, pronunciation: "/test/", meaning: "测试" }], usage: [], chunks: [], memoryCue: "" };
@@ -112,6 +114,9 @@ try {
   const migratedConfig = await json(`${app}/api/config`);
   assert.equal(migratedConfig.providerId, "default");
   assert.equal(migratedConfig.providers.length, 1);
+  const homepage = await fetch(app);
+  assert.equal(homepage.status, 200);
+  assert.match(await homepage.text(), /拾词/);
 
   const invalidBase = await fetch(`${app}/api/config`, {
     method: "PUT", headers,
@@ -149,6 +154,19 @@ try {
   assert.equal(migratedLegacy.entries[0].displayText, "her footsteps hurried as she all but fled the room");
   assert.equal(migratedLegacy.entries[0].correction, "foodsteps → footsteps");
   assert.equal(migratedLegacy.entries[0].pronunciation, "");
+  const imported = await json(app + "/api/entries/import", {
+    method: "POST", headers,
+    body: JSON.stringify({ entries: [
+      { raw: "harbor", displayText: "Harbor", kind: "word", pronunciation: "/ˈhɑːrbər/", meaning: "港口", context: "新导入的测试词", words: [{ text: "Harbor", pronunciation: "/ˈhɑːrbər/", meaning: "港口" }] },
+      { raw: "her foodsteps hurried as she all but fled the room", displayText: "her footsteps hurried as she all but fled the room", kind: "sentence", meaning: "重复项" },
+      { meaning: "缺少原文" },
+    ] }),
+  });
+  assert.equal(imported.importedCount, 1);
+  assert.equal(imported.skippedCount, 1);
+  assert.equal(imported.invalidCount, 1);
+  assert.equal(imported.entries.some((entry) => entry.raw === "harbor"), true);
+  assert.equal(imported.entries.some((entry) => entry.raw === "her foodsteps hurried as she all but fled the room"), true);
 
   const models = await json(`${app}/api/models`, {
     method: "POST", headers,
@@ -179,6 +197,8 @@ try {
   assert.equal(createdResponse.status, 200);
   assert.equal(created.entry.meaning, "响应成功");
   assert.equal(created.entry.kind, "word");
+  assert.equal(created.entry.displayText, "Test");
+  assert.equal(created.entry.words[0].text, "Test");
   assert.equal(created.entry.pronunciation, "/test/");
   assert.equal(created.entry.words[0].pronunciation, "/test/");
   assert.equal(created.entry.source, "游戏");
@@ -187,6 +207,14 @@ try {
   assert.equal(calls.findLast((call) => call.path === "/v1/responses").body.stream, undefined);
   assert.equal(calls.findLast((call) => call.path === "/v1/responses").body.max_output_tokens, 4000);
   assert.equal(calls.findLast((call) => call.path === "/v1/responses").body.reasoning.effort, "low");
+
+  const intentionalCasing = await json(app + "/api/entries", {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "iPhone", source: "阅读" }),
+  });
+  assert.equal(intentionalCasing.entry.displayText, "iPhone");
+  assert.equal(intentionalCasing.entry.correction, "");
+  assert.equal(intentionalCasing.entry.words[0].text, "iPhone");
 
   const incomplete = await fetch(`${app}/api/entries`, {
     method: "POST", headers,
@@ -234,6 +262,7 @@ try {
   assert.equal(reviewed.entry.review.lastGrade, "good");
   assert.equal(reviewed.entry.review.repetitions, 1);
   assert.equal(reviewed.entry.review.intervalDays, 1);
+  assert.equal(reviewed.entry.difficulty < created.entry.difficulty, true);
 
   const wordList = await json(`${app}/api/entries`, {
     method: "POST", headers,
@@ -243,7 +272,11 @@ try {
   assert.equal(wordList.entries.length, 2);
   assert.deepEqual(wordList.entries.map((entry) => entry.kind), ["word", "word"]);
   assert.deepEqual(wordList.entries.map((entry) => entry.raw), ["alpha", "beta"]);
+  assert.deepEqual(wordList.entries.map((entry) => entry.displayText), ["Alpha", "Beta"]);
   assert.deepEqual(wordList.entries.map((entry) => entry.words[0].pronunciation), ["/ˈælfə/", "/ˈbiːtə/"]);
+  assert.deepEqual(wordList.entries.map((entry) => entry.context), ["希腊字母表的第一个字母。", "希腊字母表的第二个字母。"]);
+  assert.deepEqual(wordList.entries.map((entry) => entry.usage.length), [1, 1]);
+  assert.deepEqual(wordList.entries.map((entry) => entry.difficulty), [1.8, 2.2]);
 
   const repeatedWordListBefore = calls.length;
   const repeatedWordListHit = await json(`${app}/api/entries`, {
@@ -258,34 +291,34 @@ try {
     method: "POST", headers,
     body: JSON.stringify({ text: "alpha, xyzzy, banana", source: "阅读" }),
   });
-  assert.deepEqual(missingWord.entries.map((entry) => [entry.raw, entry.displayText]), [["alpha", "alpha"], ["banana", "banana"]]);
+  assert.deepEqual(missingWord.entries.map((entry) => [entry.raw, entry.displayText]), [["alpha", "Alpha"], ["banana", "Banana"]]);
 
   const lemmatizedWordList = await json(`${app}/api/entries`, {
     method: "POST", headers,
     body: JSON.stringify({ text: "running, jumped", source: "阅读" }),
   });
-  assert.deepEqual(lemmatizedWordList.entries.map((entry) => [entry.raw, entry.displayText, entry.correction]), [["running", "run", ""], ["jumped", "jump", ""]]);
+  assert.deepEqual(lemmatizedWordList.entries.map((entry) => [entry.raw, entry.displayText, entry.correction]), [["running", "Run", ""], ["jumped", "Jump", ""]]);
 
   const reorderedWordList = await json(`${app}/api/entries`, {
     method: "POST", headers,
     body: JSON.stringify({ text: "cherry, apple, banana", source: "阅读" }),
   });
-  assert.deepEqual(reorderedWordList.entries.map((entry) => [entry.raw, entry.displayText]), [["apple", "apple"], ["banana", "banana"], ["cherry", "cherry"]]);
+  assert.deepEqual(reorderedWordList.entries.map((entry) => [entry.raw, entry.displayText]), [["apple", "Apple"], ["banana", "Banana"], ["cherry", "Cherry"]]);
 
   const explicitlyCorrectedWordList = await json(`${app}/api/entries`, {
     method: "POST", headers,
     body: JSON.stringify({ text: "epsilon, zetta", source: "阅读" }),
   });
-  assert.deepEqual(explicitlyCorrectedWordList.entries.map((entry) => [entry.raw, entry.displayText, entry.correction]), [["epsilon", "epsilon", ""], ["zetta", "zeta", "zetta → zeta"]]);
+  assert.deepEqual(explicitlyCorrectedWordList.entries.map((entry) => [entry.raw, entry.displayText, entry.correction]), [["epsilon", "Epsilon", ""], ["zetta", "Zeta", "zetta → zeta"]]);
 
   const correctedWordList = await json(`${app}/api/entries`, {
     method: "POST", headers,
     body: JSON.stringify({ text: "gamma, deltta", source: "阅读" }),
   });
   assert.deepEqual(correctedWordList.entries.map((entry) => entry.raw), ["gamma", "deltta"]);
-  assert.deepEqual(correctedWordList.entries.map((entry) => entry.displayText), ["gamma", "delta"]);
+  assert.deepEqual(correctedWordList.entries.map((entry) => entry.displayText), ["Gamma", "Delta"]);
   assert.equal(correctedWordList.entries[1].correction, "deltta → delta");
-  assert.deepEqual(correctedWordList.entries.map((entry) => entry.context), ["", ""]);
+  assert.deepEqual(correctedWordList.entries.map((entry) => entry.context), ["词表", "词表"]);
 
   const repeatedWordList = await json(`${app}/api/entries`, {
     method: "POST", headers,
