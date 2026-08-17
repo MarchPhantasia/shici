@@ -101,6 +101,8 @@ const state = {
   sort: "recent",
   newEntryIds: [],
   activeThreadId: null,
+  selectedThreadEntryId: null,
+  threadAnchorId: null,
   selectedEntryId: null,
   detailClosed: true,
   detailOpened: false,
@@ -545,7 +547,7 @@ function filteredEntries() {
     if (!query) return true;
     let haystack = searchCache.get(entry);
     if (!haystack) {
-      haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning, ...(word.partOfSpeech || []), ...(word.forms || []).flatMap((form) => [form.form, form.label])])].join(" ").toLowerCase();
+      haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.thread || []).flatMap((turn) => [turn.question, turn.answer, turn.summary]), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning, ...(word.partOfSpeech || []), ...(word.forms || []).flatMap((form) => [form.form, form.label])])].join(" ").toLowerCase();
       searchCache.set(entry, haystack);
     }
     return haystack.includes(query);
@@ -562,6 +564,35 @@ function filteredEntries() {
     source: (left, right) => (left.source || "未标记").localeCompare(right.source || "未标记", "zh-CN") || recent(left, right),
   };
   return entries.sort(comparators[state.sort] || recent);
+}
+
+function threadedEntries() {
+  return filteredEntries()
+    .filter((entry) => entry.thread?.length)
+    .sort((left, right) => Number(right.thread.at(-1)?.createdAt || 0) - Number(left.thread.at(-1)?.createdAt || 0));
+}
+
+function reconcileThreadState() {
+  const ids = new Set(state.entries.map((entry) => entry.id));
+  if (state.selectedThreadEntryId && !ids.has(state.selectedThreadEntryId)) state.selectedThreadEntryId = null;
+  if (state.threadAnchorId && !ids.has(state.threadAnchorId)) state.threadAnchorId = null;
+}
+
+function renderThreadIndex() {
+  const entries = threadedEntries();
+  if (!entries.length) {
+    const message = state.entries.some((entry) => entry.thread?.length)
+      ? "没有匹配的追问。换一个搜索词，或从词库打开一个词条。"
+      : "还没有追问。去词库打开一个词条，或用上方 @ 直接开始。";
+    return `<div class="timeline-inner"><div class="empty-state thread-empty">${icon("messages-square")}<h2>${escapeHtml(message)}</h2><button class="secondary-button" type="button" data-view="all">返回词库</button></div></div>`;
+  }
+  return `<div class="timeline-inner thread-index"><div class="thread-index-head"><span>追问索引</span><small>${entries.length} 个词条</small></div><div class="thread-index-list">${entries.map((entry) => {
+    const last = entry.thread.at(-1) || {};
+    const title = entry.displayText || entry.raw;
+    const summary = last.summary || last.question || "等待归纳";
+    const selected = state.selectedThreadEntryId === entry.id;
+    return `<button class="thread-index-row ${selected ? "selected" : ""}" type="button" data-action="open-thread" data-id="${escapeHtml(entry.id)}" aria-pressed="${selected}"><span class="thread-index-main"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(summary)}</span></span><span class="thread-index-meta"><b>${entry.thread.length} 轮</b><time>${formatTime(last.createdAt)}</time></span></button>`;
+  }).join("")}</div></div>`;
 }
 
 function renderThread(entry) {
@@ -776,6 +807,15 @@ function renderTimeline() {
     refreshIcons();
     return;
   }
+  if (state.view === "threads") {
+    state.selectedEntryId = null;
+    state.detailClosed = true;
+    state.detailOpened = false;
+    elements.timeline.innerHTML = renderThreadIndex();
+    renderDetailPanel();
+    refreshIcons();
+    return;
+  }
   const entries = filteredEntries();
   const visible = entries.slice(0, state.visibleLimit);
   if (!state.detailClosed && !entries.some((entry) => entry.id === state.selectedEntryId)) state.selectedEntryId = visible[0]?.id || null;
@@ -817,6 +857,7 @@ function renderNavigation() {
   const copy = {
     all: ["词库", state.sourceFilter ? `${state.sourceFilter} · ${filteredEntries().length} 条` : `${state.entries.length} 个散落在不同场景里的语言片段`],
     review: ["专注复习", "根据你的回忆质量安排下一次出现"],
+    threads: ["追问工作台", `${threadedEntries().length} 个有后续理解的语言片段`],
     starred: ["收藏片段", `${starCount} 个主动保留的重点`],
     capture: ["记录", ""],
   }[state.view];
@@ -829,7 +870,7 @@ function renderNavigation() {
   syncCustomSelect(elements.filterSelect);
   elements.sortSelect.value = state.sort;
   syncCustomSelect(elements.sortSelect);
-  elements.captureGrid.hidden = state.view === "review";
+  elements.captureGrid.hidden = state.view === "review" || state.view === "threads";
   elements.libraryHead.hidden = state.view === "review";
   elements.capturePage.hidden = state.view !== "capture";
   elements.searchBox.hidden = state.view === "review" || state.view === "capture";
@@ -868,6 +909,7 @@ function renderCapturePage() {
 }
 
 function render() {
+  reconcileThreadState();
   renderNavigation();
   renderTimeline();
   renderNewEntryNotice();
@@ -1257,6 +1299,11 @@ async function handleAction(action, id, grade, turnId, hint) {
   if (action === "settings") return openSettings();
   if (action === "close-settings") return elements.dialog.close();
   if (action === "open-detail" && entry) return openEntryDetail(entry);
+  if (action === "open-thread" && entry) {
+    state.selectedThreadEntryId = entry.id;
+    renderTimeline();
+    return;
+  }
   if (action === "close-detail") {
     state.selectedEntryId = null;
     state.detailClosed = true;

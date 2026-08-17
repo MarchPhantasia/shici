@@ -790,6 +790,22 @@ dialog[open] { animation: dialog-in 180ms ease both; }
 .entry-card.selected .entry-row-copy > strong { color: var(--teal); }
 .entry-card.selected .entry-row-copy > span i { color: var(--teal); }
 
+.thread-index-head { display: flex; align-items: baseline; justify-content: space-between; min-height: 34px; padding: 0 10px 8px; border-bottom: 1px solid var(--border); color: var(--faint); font-size: var(--font-caption); font-weight: 650; }
+.thread-index-head small { color: var(--muted); font-size: var(--font-caption); font-weight: 400; }
+.thread-index-list { display: grid; }
+.thread-index-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; width: 100%; min-height: 68px; padding: 11px 10px; border: 0; border-bottom: 1px solid var(--border); background: transparent; color: var(--text); text-align: left; cursor: pointer; transition: background 150ms ease, box-shadow 150ms ease; }
+.thread-index-row:hover, .thread-index-row.selected { background: var(--surface-soft); }
+.thread-index-row.selected { box-shadow: inset 2px 0 0 var(--pink); }
+.thread-index-main { display: grid; min-width: 0; gap: 5px; }
+.thread-index-main strong, .thread-index-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-index-main strong { font-size: var(--font-entry); font-weight: 650; }
+.thread-index-main span { color: var(--muted); font-size: var(--font-support); }
+.thread-index-meta { display: grid; justify-items: end; gap: 4px; color: var(--faint); white-space: nowrap; }
+.thread-index-meta b { color: var(--teal); font-size: var(--font-caption); font-weight: 650; }
+.thread-index-meta time { font-size: var(--font-caption); }
+.thread-empty { gap: 10px; }
+.thread-empty h2 { max-width: 360px; line-height: 1.55; }
+
 .detail-panel { min-width: 0; min-height: 0; height: calc(100% - 12px); margin-top: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 3px; background: var(--surface); box-shadow: 0 3px 18px rgba(31, 104, 96, .045); }
 .detail-panel[hidden] { display: block !important; visibility: hidden; border-color: transparent; background: transparent; box-shadow: none; }
 .detail-sheet { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100%; max-height: none; }
