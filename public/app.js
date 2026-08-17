@@ -98,17 +98,22 @@ const state = {
   view: "all",
   query: "",
   sourceFilter: "",
+  sort: "recent",
+  newEntryIds: [],
   activeThreadId: null,
   selectedEntryId: null,
-  detailClosed: false,
+  detailClosed: true,
   detailOpened: false,
   visibleLimit: 80,
   reviewReveal: false,
+  reviewHint: "",
   reviewSessionTotal: 0,
   reviewFocusId: null,
   ai: { mode: "checking", model: "", apiStyle: "responses" },
-  busy: true,
+  webdav: { enabled: false, baseUrl: "", username: "", remotePath: "shici/library.json", hasPassword: false, lastStatus: "", lastError: "" },
+  webdavSyncBusy: false,
   activeRequest: null,
+  activeRequests: new Map(),
   storageReady: false,
 };
 const searchCache = new WeakMap();
@@ -130,6 +135,8 @@ const elements = {
   input: document.querySelector("#fragment-input"),
   source: document.querySelector("#source-select"),
   filterSelect: document.querySelector("#library-filter-select"),
+  sortSelect: document.querySelector("#library-sort-select"),
+  newEntryNotice: document.querySelector("#new-entry-notice"),
   focusCount: document.querySelector("#focus-count"),
   focusLabel: document.querySelector("#focus-label"),
   focusProgress: document.querySelector("#focus-progress"),
@@ -169,6 +176,17 @@ const elements = {
   fontScaleValue: document.querySelector("#font-scale-value"),
   sendShortcut: document.querySelector("#send-shortcut"),
   importJson: document.querySelector("#import-json"),
+  webdavForm: document.querySelector("#webdav-form"),
+  webdavBaseUrl: document.querySelector("#webdav-base-url"),
+  webdavUsername: document.querySelector("#webdav-username"),
+  webdavPassword: document.querySelector("#webdav-password"),
+  webdavRemotePath: document.querySelector("#webdav-remote-path"),
+  webdavEnabled: document.querySelector("#webdav-enabled"),
+  webdavStatusPill: document.querySelector("#webdav-status-pill"),
+  webdavMessage: document.querySelector("#webdav-message"),
+  webdavTest: document.querySelector("#webdav-test"),
+  webdavSave: document.querySelector("#webdav-save"),
+  webdavSync: document.querySelector("#webdav-sync"),
 };
 
 async function apiFetch(url, options = {}) {
@@ -208,7 +226,111 @@ async function requestJson(url, options = {}) {
   const response = await apiFetch(url, options);
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || `请求失败 (${response.status})`);
+  if (options.method && options.method !== "GET" && /^\/api\/entries(?:\/|$)/.test(url)) scheduleWebdavSync();
   return result;
+}
+
+function setWebdavMessage(message = "", error = false) {
+  elements.webdavMessage.textContent = message;
+  elements.webdavMessage.classList.toggle("error", error);
+}
+
+function renderWebdavStatus() {
+  const configured = Boolean(state.webdav.baseUrl);
+  const pill = elements.webdavStatusPill;
+  const status = state.webdav.lastError ? "同步失败" : state.webdav.lastStatus;
+  pill.textContent = state.webdavSyncBusy ? "同步中" : state.webdav.lastError ? "需检查" : state.webdav.enabled ? (status === "unchanged" ? "已同步" : "自动同步") : configured ? "已配置" : "未配置";
+  pill.classList.toggle("live", state.webdav.enabled && !state.webdav.lastError);
+  pill.classList.toggle("demo", !state.webdav.enabled || Boolean(state.webdav.lastError));
+  elements.webdavBaseUrl.value = state.webdav.baseUrl || "";
+  elements.webdavUsername.value = state.webdav.username || "";
+  elements.webdavRemotePath.value = state.webdav.remotePath || "shici/library.json";
+  elements.webdavEnabled.checked = Boolean(state.webdav.enabled);
+  elements.webdavPassword.placeholder = state.webdav.hasPassword ? "已保存，留空不修改" : "输入密码（可选）";
+}
+
+function webdavDraft() {
+  return {
+    enabled: elements.webdavEnabled.checked,
+    baseUrl: elements.webdavBaseUrl.value.trim(),
+    username: elements.webdavUsername.value.trim(),
+    password: elements.webdavPassword.value,
+    remotePath: elements.webdavRemotePath.value.trim(),
+  };
+}
+
+async function loadWebdavConfig() {
+  try {
+    state.webdav = await requestJson("/api/webdav");
+    renderWebdavStatus();
+  } catch (error) {
+    state.webdav = { ...state.webdav, lastError: error.message || "无法读取同步配置" };
+    renderWebdavStatus();
+  }
+}
+
+function scheduleWebdavSync() {
+  clearTimeout(scheduleWebdavSync.timer);
+  if (!state.webdav.enabled || state.webdavSyncBusy) return;
+  scheduleWebdavSync.timer = setTimeout(() => runWebdavSync({ silent: true }).catch(() => {}), 1600);
+}
+
+async function runWebdavSync({ silent = false } = {}) {
+  if (state.webdavSyncBusy) return;
+  state.webdavSyncBusy = true;
+  renderWebdavStatus();
+  if (!silent) setWebdavMessage("正在同步…");
+  [elements.webdavTest, elements.webdavSave, elements.webdavSync].forEach((button) => { if (button) button.disabled = true; });
+  try {
+    const result = await requestJson("/api/webdav/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    if (Array.isArray(result.entries)) {
+      state.entries = result.entries;
+      render();
+    }
+    state.webdav = { ...state.webdav, ...result, lastStatus: result.status || state.webdav.lastStatus, lastError: "" };
+    renderWebdavStatus();
+    if (!silent) setWebdavMessage(result.status === "unchanged" ? "本地与远端没有变化。" : "同步完成。", false);
+  } catch (error) {
+    state.webdav.lastError = error.message || "同步失败";
+    renderWebdavStatus();
+    if (!silent) setWebdavMessage(state.webdav.lastError, true);
+  } finally {
+    state.webdavSyncBusy = false;
+    renderWebdavStatus();
+    [elements.webdavTest, elements.webdavSave, elements.webdavSync].forEach((button) => { if (button) button.disabled = false; });
+  }
+}
+
+async function saveWebdavConfig(event) {
+  event.preventDefault();
+  elements.webdavSave.disabled = true;
+  setWebdavMessage("正在保存…");
+  try {
+    const result = await requestJson("/api/webdav", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(webdavDraft()) });
+    state.webdav = { ...state.webdav, ...result, lastError: "" };
+    elements.webdavPassword.value = "";
+    renderWebdavStatus();
+    setWebdavMessage("同步配置已保存。", false);
+    toast("WebDAV 配置已保存");
+    if (state.webdav.enabled) await runWebdavSync({ silent: false });
+  } catch (error) {
+    setWebdavMessage(error.message || "保存失败", true);
+  } finally {
+    elements.webdavSave.disabled = false;
+  }
+}
+
+async function testWebdav() {
+  elements.webdavTest.disabled = true;
+  setWebdavMessage("正在测试连接…");
+  try {
+    const result = await requestJson("/api/webdav/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(webdavDraft()) });
+    setWebdavMessage(`连接成功（HTTP ${result.status}）。`, false);
+  } catch (error) {
+    setWebdavMessage(error.message || "连接失败", true);
+  } finally {
+    elements.webdavTest.disabled = false;
+  }
 }
 
 async function load() {
@@ -227,7 +349,6 @@ async function load() {
     }
   }
   state.entries = Array.isArray(result.entries) ? result.entries : [];
-  state.selectedEntryId ||= state.entries[0]?.id || null;
   state.storageReady = true;
   localStorage.removeItem(STORAGE_KEY);
 }
@@ -349,7 +470,11 @@ function refreshIcons() {
 
 function renderWords(entry, className = "word-grid") {
   if (!entry.words?.length) return "";
-  return `<div class="${className}">${entry.words.map((word) => `<div><strong>${escapeHtml(word.text)}</strong>${word.pronunciation ? `<span>${escapeHtml(word.pronunciation)}</span>` : ""}<p>${escapeHtml(word.meaning)}</p></div>`).join("")}</div>`;
+  return `<div class="${className}">${entry.words.map((word) => {
+    const parts = Array.isArray(word.partOfSpeech) ? word.partOfSpeech.filter(Boolean).join(" / ") : "";
+    const forms = Array.isArray(word.forms) ? word.forms.filter((item) => item?.form && item?.label) : [];
+    return `<div><strong>${escapeHtml(word.text)}</strong>${word.pronunciation ? `<span>${escapeHtml(word.pronunciation)}</span>` : ""}${parts ? `<small class="word-pos">${escapeHtml(parts)}</small>` : ""}<p>${escapeHtml(word.meaning)}</p>${forms.length ? `<div class="word-forms">${forms.map((item) => `<span><b>${escapeHtml(item.label)}</b> ${escapeHtml(item.form)}</span>`).join("")}</div>` : ""}</div>`;
+  }).join("")}</div>`;
 }
 
 function formatTime(timestamp) {
@@ -414,17 +539,29 @@ function dueLabel(entry) {
 
 function filteredEntries() {
   const query = state.query.trim().toLowerCase();
-  return state.entries.filter((entry) => {
+  const entries = state.entries.filter((entry) => {
     if (state.view === "starred" && !entry.starred) return false;
     if (state.sourceFilter && entry.source !== state.sourceFilter) return false;
     if (!query) return true;
     let haystack = searchCache.get(entry);
     if (!haystack) {
-      haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning])].join(" ").toLowerCase();
+      haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning, ...(word.partOfSpeech || []), ...(word.forms || []).flatMap((form) => [form.form, form.label])])].join(" ").toLowerCase();
       searchCache.set(entry, haystack);
     }
     return haystack.includes(query);
   });
+  const text = (entry) => entry.displayText || entry.raw || "";
+  const recent = (left, right) => Number(right.createdAt) - Number(left.createdAt);
+  const comparators = {
+    recent,
+    oldest: (left, right) => Number(left.createdAt) - Number(right.createdAt),
+    due: (left, right) => Number(reviewState(left).dueAt) - Number(reviewState(right).dueAt) || recent(left, right),
+    "difficulty-desc": (left, right) => Number(right.difficulty) - Number(left.difficulty) || recent(left, right),
+    "difficulty-asc": (left, right) => Number(left.difficulty) - Number(right.difficulty) || recent(left, right),
+    alpha: (left, right) => text(left).localeCompare(text(right), "en", { sensitivity: "base", numeric: true }),
+    source: (left, right) => (left.source || "未标记").localeCompare(right.source || "未标记", "zh-CN") || recent(left, right),
+  };
+  return entries.sort(comparators[state.sort] || recent);
 }
 
 function renderThread(entry) {
@@ -453,9 +590,10 @@ function renderSourcePicker(entry) {
 function renderDetailPanel() {
   const entry = state.entries.find((item) => item.id === state.selectedEntryId);
   const mobile = matchMedia("(max-width: 760px)").matches;
-  const visible = Boolean(entry) && state.view !== "review" && (!mobile || state.detailOpened);
+  const visible = Boolean(entry) && !state.detailClosed && state.view !== "review" && (!mobile || state.detailOpened);
   elements.detailPanel.hidden = !visible;
   elements.detailBackdrop.hidden = !visible;
+  elements.workspace.classList.toggle("detail-visible", visible);
   if (!visible) {
     elements.detailContent.innerHTML = "";
     return;
@@ -529,6 +667,11 @@ function renderDetailPanel() {
 }
 
 function openEntryDetail(entry) {
+  if (state.activeThreadId && state.activeThreadId !== entry.id) state.activeThreadId = null;
+  if (state.newEntryIds.includes(entry.id)) {
+    state.newEntryIds = state.newEntryIds.filter((entryId) => entryId !== entry.id);
+    renderNewEntryNotice();
+  }
   const previousId = state.selectedEntryId;
   state.selectedEntryId = entry.id;
   state.detailClosed = false;
@@ -548,12 +691,16 @@ function openEntryDetail(entry) {
 function renderEntry(entry) {
   const selected = state.selectedEntryId === entry.id;
   const meta = entry.meaning || kindLabels[entry.kind] || "语言片段";
+  const wordParts = entry.kind === "word" && entry.words?.[0]?.partOfSpeech?.length
+    ? entry.words[0].partOfSpeech.filter(Boolean).join(" / ")
+    : "";
   return `<article class="entry-card ${selected ? "selected" : ""} ${isDue(entry) ? "due" : ""}" data-entry-id="${entry.id}">
     <button class="entry-row" type="button" data-action="open-detail" data-id="${entry.id}" aria-pressed="${selected}">
       <span class="entry-check" aria-hidden="true"></span>
       <span class="entry-row-copy">
         <strong>${escapeHtml(entry.displayText || entry.raw)}</strong>
         <span><em>${escapeHtml(meta)}</em><i>${entry.source ? escapeHtml(entry.source) : kindLabels[entry.kind] || "片段"} · ${entry.status === "review" ? (isDue(entry) ? "待复习" : "待安排") : (isDue(entry) ? "已到期" : "已学习")}${reviewState(entry).leech ? " · 顽固词" : ""}</i></span>
+        ${wordParts ? `<small class="entry-word-meta">${escapeHtml(wordParts)}</small>` : ""}
         ${entry.correction ? `<small>已纠正 ${escapeHtml(entry.correction)}</small>` : ""}
       </span>
       ${icon(selected ? "chevron-down" : "chevron-right")}
@@ -561,11 +708,31 @@ function renderEntry(entry) {
   </article>`;
 }
 
+function renderReviewHint(entry) {
+  if (!state.reviewHint) return "";
+  if (state.reviewHint === "weak") {
+    const usage = (entry.usage || []).filter(Boolean).slice(0, 2);
+    const chunks = (entry.chunks || []).filter((chunk) => chunk?.text || chunk?.meaning).slice(0, 3);
+    const content = usage.length
+      ? `<div class="review-hint-copy">${usage.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div>`
+      : chunks.length
+        ? `<div class="review-hint-chunks">${chunks.map((chunk) => `<span><strong>${escapeHtml(chunk.text)}</strong>${escapeHtml(chunk.meaning)}</span>`).join("")}</div>`
+        : `<p>这个片段暂时没有可用的例句提示。</p>`;
+    return `<aside class="review-hint-panel weak"><span>${icon("lightbulb")}弱提示</span>${content}</aside>`;
+  }
+  const details = [...new Set([entry.context, entry.conclusion].filter(Boolean))];
+  return `<aside class="review-hint-panel strong"><span>${icon("sparkles")}AI 理解</span>${details.length ? details.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : `<p>${escapeHtml(entry.meaning || "暂无更多理解提示。")}</p>`}</aside>`;
+}
+
 function renderReview() {
   const entries = dueEntries();
   const entry = entries[0];
   if (!entry) {
     return `<div class="review-shell review-complete">${icon("circle-check-big")}<h2>今天已经复习完成</h2><p>新的片段会在适合的时间重新出现。</p><button type="button" class="secondary-button" data-view="all">返回词库</button></div>`;
+  }
+  if (state.reviewFocusId !== entry.id) {
+    state.reviewFocusId = entry.id;
+    state.reviewHint = "";
   }
   if (!state.reviewSessionTotal) state.reviewSessionTotal = entries.length;
   const completed = Math.max(0, state.reviewSessionTotal - entries.length);
@@ -591,7 +758,7 @@ function renderReview() {
       </div>
       ${state.reviewReveal
         ? `<div class="review-grades">${grades.map(([grade, label, gradeIcon]) => `<button type="button" data-action="grade-review" data-id="${entry.id}" data-grade="${grade}">${icon(gradeIcon)}<strong>${label}</strong><small>${formatInterval(previewInterval(entry, grade))}</small></button>`).join("")}</div>`
-        : `<button class="reveal-button" type="button" data-action="reveal-review">${icon("eye")}显示答案</button>`}
+        : `<div class="review-hint-controls"><button class="${state.reviewHint === "weak" ? "active" : ""}" type="button" data-action="review-hint" data-hint="weak">${icon("lightbulb")}弱提示</button><button class="${state.reviewHint === "strong" ? "active" : ""}" type="button" data-action="review-hint" data-hint="strong">${icon("sparkles")}强提示</button></div>${renderReviewHint(entry)}<button class="reveal-button" type="button" data-action="reveal-review">${icon("eye")}显示答案</button>`}
     </article>
   </div>`;
 }
@@ -623,6 +790,20 @@ function renderTimeline() {
   refreshIcons();
 }
 
+function renderNewEntryNotice() {
+  const entries = state.newEntryIds.map((id) => state.entries.find((entry) => entry.id === id)).filter(Boolean);
+  state.newEntryIds = entries.map((entry) => entry.id);
+  const visible = state.view === "all" && entries.length > 0;
+  elements.newEntryNotice.hidden = !visible;
+  if (!visible) {
+    elements.newEntryNotice.innerHTML = "";
+    return;
+  }
+  const names = entries.slice(0, 3).map((entry) => entry.displayText || entry.raw).join("、");
+  const links = entries.slice(0, 3).map((entry) => `<button class="new-entry-link" type="button" data-action="open-new-entry" data-id="${entry.id}">${escapeHtml(entry.displayText || entry.raw)}</button>`).join("");
+  elements.newEntryNotice.innerHTML = `<div>${icon("circle-check")}<span><strong>${entries.length === 1 ? "新词已加入" : `${entries.length} 个新词已加入`}</strong><small>${escapeHtml(names)}${entries.length > 3 ? ` 等 ${entries.length} 个` : ""}</small></span></div><span class="new-entry-notice-actions">${links}<button class="icon-button" type="button" data-action="dismiss-new-entries" aria-label="关闭新词提醒">${icon("x")}</button></span>`;
+}
+
 function renderNavigation() {
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
   const reviewCount = dueEntries().length;
@@ -646,6 +827,8 @@ function renderNavigation() {
   elements.filterSelect.innerHTML = `<option value="all">全部</option><option value="starred">收藏 (${starCount})</option>${sources.map((source) => `<option value="source:${escapeHtml(source)}">${escapeHtml(source)}</option>`).join("")}`;
   elements.filterSelect.value = state.view === "starred" ? "starred" : state.sourceFilter ? `source:${state.sourceFilter}` : "all";
   syncCustomSelect(elements.filterSelect);
+  elements.sortSelect.value = state.sort;
+  syncCustomSelect(elements.sortSelect);
   elements.captureGrid.hidden = state.view === "review";
   elements.libraryHead.hidden = state.view === "review";
   elements.capturePage.hidden = state.view !== "capture";
@@ -659,14 +842,14 @@ function renderNavigation() {
 
 function renderComposer() {
   const entry = state.entries.find((item) => item.id === state.activeThreadId);
-  const stopping = Boolean(state.activeRequest);
+  const stopping = state.activeRequests.size > 0;
   if (!entry) state.activeThreadId = null;
   elements.contextBar.hidden = !entry;
   elements.contextTitle.textContent = entry ? `· ${entry.displayText || entry.raw}` : "";
   elements.input.placeholder = entry ? "继续追问这个片段…" : "记录一个不懂的词、短语或句子…";
   elements.source.disabled = Boolean(entry);
   elements.composer.classList.toggle("processing", stopping);
-  elements.send.disabled = !state.storageReady || (state.busy && !stopping);
+  elements.send.disabled = !state.storageReady;
   elements.send.classList.toggle("stop", stopping);
   elements.send.setAttribute("aria-label", stopping ? "停止生成" : `发送（${shortcutLabels[appearance.sendShortcut]}）`);
   elements.send.title = stopping ? "停止生成" : `发送：${shortcutLabels[appearance.sendShortcut]}`;
@@ -675,9 +858,9 @@ function renderComposer() {
 }
 
 function renderCapturePage() {
-  const stopping = Boolean(state.activeRequest);
+  const stopping = state.activeRequests.size > 0;
   elements.captureComposer.classList.toggle("processing", stopping);
-  elements.captureSend.disabled = !state.storageReady || (state.busy && !stopping);
+  elements.captureSend.disabled = !state.storageReady;
   elements.captureSend.classList.toggle("stop", stopping);
   elements.captureSend.setAttribute("aria-label", stopping ? "停止生成" : `发送（${shortcutLabels[appearance.sendShortcut]}）`);
   elements.captureSend.title = stopping ? "停止生成" : `发送：${shortcutLabels[appearance.sendShortcut]}`;
@@ -687,6 +870,7 @@ function renderCapturePage() {
 function render() {
   renderNavigation();
   renderTimeline();
+  renderNewEntryNotice();
   renderComposer();
   renderCapturePage();
   refreshIcons();
@@ -721,11 +905,6 @@ function confirmAction(message, { title = "确认操作", confirmLabel = "确认
     elements.confirmDialog.addEventListener("close", finish, { once: true });
     elements.confirmDialog.showModal();
   });
-}
-
-function setBusy(value) {
-  state.busy = value;
-  render();
 }
 
 function apiStyleInput() {
@@ -766,8 +945,8 @@ function renderAiState() {
     target.innerHTML = html;
     target.title = title;
   });
-  if (state.activeRequest) {
-    setTargets("processing", `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>${state.activeThreadId ? "正在整理追问" : "正在理解片段"}`, "正在等待模型返回，可点击停止按钮取消");
+  if (state.activeRequests.size) {
+    setTargets("processing", `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>正在处理 ${state.activeRequests.size > 1 ? `${state.activeRequests.size} 个请求` : state.activeThreadId ? "追问" : "片段"}`, "正在等待模型返回，可点击停止按钮取消");
     elements.aiState.hidden = false;
     elements.captureAiState.hidden = false;
     elements.quickModelSelect.hidden = true;
@@ -850,7 +1029,7 @@ async function openSettings() {
   renderNavigation();
   elements.dialog.showModal();
   showConfigMessage("");
-  await getAiStatus(true);
+  await Promise.all([getAiStatus(true), loadWebdavConfig()]);
   syncAppearanceControls();
   refreshIcons();
 }
@@ -952,12 +1131,14 @@ async function submitFragment(event, forceNew = false, overrideText = "") {
   const input = form.querySelector("textarea");
   const source = form.querySelector("select");
   const text = (overrideText || input.value).trim();
-  if (!text || state.busy || !state.storageReady) return;
+  if (!text || !state.storageReady) return;
   const active = state.entries.find((entry) => entry.id === state.activeThreadId);
+  const wasCapture = state.view === "capture";
   const pending = { id: crypto.randomUUID(), controller: new AbortController() };
 
+  state.activeRequests.set(pending.id, pending);
   state.activeRequest = pending;
-  setBusy(true);
+  render();
   try {
     const result = await requestJson(active ? `/api/entries/${active.id}/followups` : "/api/entries", {
       method: "POST",
@@ -969,14 +1150,15 @@ async function submitFragment(event, forceNew = false, overrideText = "") {
     if (pending.controller.signal.aborted) return;
     if (active) {
       state.entries[state.entries.findIndex((entry) => entry.id === active.id)] = result.entry;
-      state.selectedEntryId = active.id;
     } else {
       const returnedEntries = Array.isArray(result.entries) && result.entries.length ? result.entries : [result.entry];
       const additions = returnedEntries.filter((item) => !state.entries.some((entry) => entry.id === item.id));
       state.entries.unshift(...additions);
-      state.selectedEntryId = result.entry.id;
-      state.view = "all";
-      state.sourceFilter = "";
+      if (additions.length) state.newEntryIds = [...new Set([...additions.map((entry) => entry.id), ...state.newEntryIds])];
+      if (wasCapture) {
+        state.view = "all";
+        state.sourceFilter = "";
+      }
     }
     input.value = "";
     input.style.height = "auto";
@@ -989,9 +1171,9 @@ async function submitFragment(event, forceNew = false, overrideText = "") {
     const stopped = pending.controller.signal.aborted || error.name === "AbortError" || error.message === "请求已暂停";
     toast(stopped ? "已停止，内容未保存" : (error.message || "解释失败"));
   } finally {
-    if (state.activeRequest?.id === pending.id) state.activeRequest = null;
-    setBusy(false);
-    (state.view === "capture" ? elements.captureInput : elements.input).focus();
+    state.activeRequests.delete(pending.id);
+    if (state.activeRequest?.id === pending.id) state.activeRequest = [...state.activeRequests.values()].at(-1) || null;
+    render();
   }
 }
 
@@ -1037,9 +1219,29 @@ async function restoreEntries(entries) {
   toast("已撤销");
 }
 
-async function handleAction(action, id, grade, turnId) {
+async function handleAction(action, id, grade, turnId, hint) {
   const entry = state.entries.find((item) => item.id === id);
   if (action === "new-fragment") return newFragment();
+  if (action === "dismiss-new-entries") {
+    state.newEntryIds = [];
+    return renderNewEntryNotice();
+  }
+  if (action === "open-new-entry" && entry) {
+    state.newEntryIds = state.newEntryIds.filter((entryId) => entryId !== entry.id);
+    state.view = "all";
+    state.query = "";
+    elements.search.value = "";
+    elements.searchBox.classList.remove("has-value");
+    state.sourceFilter = "";
+    state.detailClosed = false;
+    state.detailOpened = true;
+    const index = filteredEntries().findIndex((item) => item.id === entry.id);
+    state.visibleLimit = Math.max(80, index + 1);
+    state.selectedEntryId = entry.id;
+    render();
+    elements.timeline.querySelector(`[data-entry-id="${CSS.escape(entry.id)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    return;
+  }
   if (action === "focus-composer") {
     state.view = "capture";
     state.activeThreadId = null;
@@ -1077,6 +1279,10 @@ async function handleAction(action, id, grade, turnId) {
   if (action === "clear-search") { state.query = ""; elements.search.value = ""; elements.searchBox.classList.remove("has-value"); return renderTimeline(); }
   if (action === "import") { elements.importJson.click(); return; }
   if (action === "load-more") { state.visibleLimit += 80; return renderTimeline(); }
+  if (action === "review-hint") {
+    state.reviewHint = hint === "strong" ? "strong" : "weak";
+    return renderTimeline();
+  }
   if (action === "reveal-review") { state.reviewReveal = true; return renderTimeline(); }
   if (action === "start-review" && entry) {
     state.view = "review";
@@ -1084,6 +1290,7 @@ async function handleAction(action, id, grade, turnId) {
     state.reviewFocusId = entry.id;
     state.reviewSessionTotal = dueEntries().length;
     state.reviewReveal = false;
+    state.reviewHint = "";
     return render();
   }
   if (action === "grade-review" && entry) {
@@ -1092,6 +1299,7 @@ async function handleAction(action, id, grade, turnId) {
     });
     state.entries[state.entries.indexOf(entry)] = result.entry;
     state.reviewReveal = false;
+    state.reviewHint = "";
     state.reviewFocusId = null;
     toast(`已安排在 ${formatInterval(reviewState(result.entry).intervalDays)}后复习`);
     return render();
@@ -1188,7 +1396,7 @@ async function importLibraryFile(event) {
 document.addEventListener("click", (event) => {
   const actionTarget = event.target.closest("[data-action]");
   if (actionTarget) {
-    handleAction(actionTarget.dataset.action, actionTarget.dataset.id, actionTarget.dataset.grade, actionTarget.dataset.turnId).catch((error) => toast(error.message || "操作失败"));
+    handleAction(actionTarget.dataset.action, actionTarget.dataset.id, actionTarget.dataset.grade, actionTarget.dataset.turnId, actionTarget.dataset.hint).catch((error) => toast(error.message || "操作失败"));
     return;
   }
   const viewTarget = event.target.closest("[data-view]");
@@ -1199,6 +1407,7 @@ document.addEventListener("click", (event) => {
     state.sourceFilter = "";
     state.visibleLimit = 80;
     state.reviewReveal = false;
+    state.reviewHint = "";
     state.reviewFocusId = null;
     state.reviewSessionTotal = state.view === "review" ? dueEntries().length : 0;
     elements.timeline.scrollTop = 0;
@@ -1232,6 +1441,14 @@ elements.filterSelect.addEventListener("change", () => {
   }
   render();
 });
+elements.sortSelect.addEventListener("change", () => {
+  state.sort = elements.sortSelect.value;
+  state.visibleLimit = 80;
+  elements.timeline.scrollTop = 0;
+  renderTimeline();
+  renderNewEntryNotice();
+  refreshIcons();
+});
 
 elements.composer.addEventListener("submit", submitFragment);
 elements.send.addEventListener("click", (event) => {
@@ -1246,6 +1463,9 @@ elements.captureSend.addEventListener("click", (event) => {
   stopRequest();
 });
 elements.configForm.addEventListener("submit", saveAiConfig);
+elements.webdavForm.addEventListener("submit", saveWebdavConfig);
+elements.webdavTest.addEventListener("click", testWebdav);
+elements.webdavSync.addEventListener("click", () => runWebdavSync({ silent: false }));
 elements.importJson.addEventListener("change", importLibraryFile);
 elements.refreshModels.addEventListener("click", refreshModelList);
 elements.providerSelect.addEventListener("change", () => activateProvider().catch((error) => toast(error.message || "切换失败")));
@@ -1273,7 +1493,7 @@ elements.allowNoKey.addEventListener("change", () => {
   if (elements.allowNoKey.checked) elements.apiKey.value = "";
 });
 elements.input.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter" || event.isComposing || state.activeRequest) return;
+  if (event.key !== "Enter" || event.isComposing) return;
   const sends = appearance.sendShortcut === "mod-enter"
     ? (event.metaKey || event.ctrlKey) && !event.shiftKey
     : appearance.sendShortcut === "shift-enter"
@@ -1282,7 +1502,7 @@ elements.input.addEventListener("keydown", (event) => {
   if (sends) { event.preventDefault(); elements.composer.requestSubmit(); }
 });
 elements.captureInput.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter" || event.isComposing || state.activeRequest) return;
+  if (event.key !== "Enter" || event.isComposing) return;
   const sends = appearance.sendShortcut === "mod-enter"
     ? (event.metaKey || event.ctrlKey) && !event.shiftKey
     : appearance.sendShortcut === "shift-enter"
@@ -1319,7 +1539,7 @@ elements.dialog.addEventListener("click", (event) => {
 render();
 getAiStatus();
 load().catch((error) => toast(error.message || "无法读取本地数据")).finally(() => {
-  state.busy = false;
   render();
+  loadWebdavConfig().then(() => { if (state.webdav.enabled) runWebdavSync({ silent: true }).catch(() => {}); });
 });
-if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=26").catch(() => {});
+if (!window.__TAURI__ && "serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=30").catch(() => {});

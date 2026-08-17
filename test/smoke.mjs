@@ -58,7 +58,7 @@ const mock = createServer(async (request, response) => {
       : input.text === "epsilon, zetta"
               ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "拼写纠错", context: "词表", words: [{ text: "epsilon", original: "epsilon", correction: "", pronunciation: "/ˈepsɪlɒn/", meaning: "艾普西隆" }, { text: "zeta", original: "zetta", correction: "zetta → zeta", pronunciation: "/ˈziːtə/", meaning: "泽塔" }], usage: [], chunks: [], memoryCue: "" }
       : input.text === "iPhone"
-        ? { type: "entry", kind: "word", displayText: "iPhone", correction: "", pronunciation: "/ˈaɪfoʊn/", meaning: "苹果手机", context: "品牌名", words: [{ text: "iPhone", pronunciation: "/ˈaɪfoʊn/", meaning: "苹果手机" }], usage: [], chunks: [], memoryCue: "" }
+        ? { type: "entry", kind: "word", displayText: "iPhone", correction: "", pronunciation: "/ˈaɪfoʊn/", meaning: "苹果手机", context: "品牌名", words: [{ text: "iPhone", pronunciation: "/ˈaɪfoʊn/", meaning: "苹果手机", partOfSpeech: ["专有名词"], forms: [] }], usage: [], chunks: [], memoryCue: "" }
       : input.kindHint === "word_list" || input.text.includes(",")
         ? { type: "entry", kind: "word_list", displayText: input.text, correction: "", pronunciation: "", meaning: "两个独立单词", context: "词表", words: [{ text: "alpha", pronunciation: "/ˈælfə/", meaning: "阿尔法", context: "希腊字母表的第一个字母。", usage: ["Alpha is the first letter. Alpha 是第一个字母。"], difficulty: 1.8 }, { text: "beta", pronunciation: "/ˈbiːtə/", meaning: "贝塔", context: "希腊字母表的第二个字母。", usage: ["The app is still in beta. 这个应用仍处于测试阶段。"], difficulty: 2.2 }], usage: [], chunks: [], memoryCue: "" }
         : input.kindHint === "phrase" || input.kindHint === "sentence"
@@ -79,6 +79,40 @@ const mock = createServer(async (request, response) => {
 });
 
 const mockPort = await listen(mock);
+let webdavBody = null;
+let webdavVersion = 0;
+let webdavGets = 0;
+let webdavPuts = 0;
+const webdav = createServer((request, response) => {
+  if (request.method === "PROPFIND") { response.statusCode = 207; return response.end(); }
+  if (request.method === "MKCOL") { response.statusCode = 201; return response.end(); }
+  if (request.method === "GET") {
+    webdavGets += 1;
+    if (!webdavBody) { response.statusCode = 404; return response.end(); }
+    const etag = `"webdav-${webdavVersion}"`;
+    if (request.headers["if-none-match"] === etag) { response.statusCode = 304; response.setHeader("ETag", etag); return response.end(); }
+    response.statusCode = 200;
+    response.setHeader("Content-Type", "application/json");
+    response.setHeader("ETag", etag);
+    return response.end(webdavBody);
+  }
+  if (request.method === "PUT") {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      webdavBody = Buffer.concat(chunks);
+      webdavVersion += 1;
+      webdavPuts += 1;
+      response.statusCode = 201;
+      response.setHeader("ETag", `"webdav-${webdavVersion}"`);
+      response.end();
+    });
+    return;
+  }
+  response.statusCode = 405;
+  response.end();
+});
+const webdavPort = await listen(webdav);
 const probe = createServer();
 const appPort = await listen(probe);
 await close(probe);
@@ -215,6 +249,8 @@ try {
   assert.equal(intentionalCasing.entry.displayText, "iPhone");
   assert.equal(intentionalCasing.entry.correction, "");
   assert.equal(intentionalCasing.entry.words[0].text, "iPhone");
+  assert.deepEqual(intentionalCasing.entry.words[0].partOfSpeech, ["专有名词"]);
+  assert.deepEqual(intentionalCasing.entry.words[0].forms, []);
 
   const incomplete = await fetch(`${app}/api/entries`, {
     method: "POST", headers,
@@ -416,6 +452,14 @@ try {
     body: JSON.stringify({ text: "kept" }),
   });
   assert.equal(keptFollowup.entry.thread.length, 1);
+  const parallelFollowups = await Promise.all(["parallel-a", "parallel-b"].map((text) => json(`${app}/api/entries/${created.entry.id}/followups`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text }),
+  })));
+  const parallelEntry = (await json(`${app}/api/entries`)).entries.find((entry) => entry.id === created.entry.id);
+  assert.equal(parallelEntry.thread.length, 3);
+  assert.deepEqual(parallelEntry.thread.slice(-2).map((turn) => turn.question).sort(), ["parallel-a", "parallel-b"]);
+  assert.equal(parallelFollowups.every((result) => result.entry.thread.length >= 2), true);
 
   const activated = await json(`${app}/api/config/default/activate`, { method: "POST" });
   assert.equal(activated.providerId, "default");
@@ -437,14 +481,46 @@ try {
   assert.equal(stored.version, 2);
   assert.equal(stored.entries.some((entry) => entry.raw === "alpha" && entry.kind === "word"), true);
   assert.equal(stored.entries.some((entry) => entry.raw === "beta" && entry.kind === "word"), true);
-  assert.equal(stored.entries.find((entry) => entry.id === created.entry.id).thread.length, 1);
+  assert.equal(stored.entries.find((entry) => entry.id === created.entry.id).thread.length, 3);
   assert.equal(stored.entries.find((entry) => entry.raw.includes("foodsteps")).displayText.includes("footsteps"), true);
   assert.equal(stored.entries.find((entry) => entry.id === created.entry.id).review.lastGrade, "good");
   assert.equal(storedSettings.providers.length, 2);
   assert.equal(storedSettings.providers.every((provider) => Object.hasOwn(provider, "apiKey")), true);
-  console.log("smoke ok: cancellation, correction, rewind, providers, word IPA, review, atomic local data");
+  const webdavRoot = `http://127.0.0.1:${webdavPort}/dav/`;
+  const webdavConfig = await json(`${app}/api/webdav`, {
+    method: "PUT", headers,
+    body: JSON.stringify({ enabled: true, baseUrl: webdavRoot, username: "smoke", password: "secret", remotePath: "shici/library.json" }),
+  });
+  assert.equal(webdavConfig.enabled, true);
+  const webdavTest = await json(`${app}/api/webdav/test`, { method: "POST", headers, body: JSON.stringify({ enabled: true, baseUrl: webdavRoot, username: "smoke", password: "secret", remotePath: "shici/library.json" }) });
+  assert.equal(webdavTest.status, 207);
+  assert.equal((await json(`${app}/api/webdav/sync`, { method: "POST", headers, body: "{}" })).status, "synced");
+  assert.equal(webdavPuts, 1);
+  assert.equal((await json(`${app}/api/webdav/sync`, { method: "POST", headers, body: "{}" })).status, "unchanged");
+  assert.equal(webdavPuts, 1);
+  const beforeWebdavEdit = await json(`${app}/api/entries`);
+  beforeWebdavEdit.entries[0].meaning = `${beforeWebdavEdit.entries[0].meaning}（同步测试）`;
+  await json(`${app}/api/entries`, { method: "PUT", headers, body: JSON.stringify({ entries: beforeWebdavEdit.entries }) });
+  assert.equal((await json(`${app}/api/webdav/sync`, { method: "POST", headers, body: "{}" })).status, "synced");
+  assert.equal(webdavPuts, 2);
+  assert.equal(webdavGets, 3);
+  const resurrectionSnapshot = await json(`${app}/api/entries`);
+  await json(`${app}/api/entries/${created.entry.id}`, { method: "DELETE", headers });
+  assert.equal((await json(`${app}/api/webdav/sync`, { method: "POST", headers, body: "{}" })).status, "synced");
+  const deletedEnvelope = JSON.parse(webdavBody);
+  const deletion = deletedEnvelope.tombstones.find((item) => item.id === created.entry.id);
+  assert.equal(Number(deletion?.updatedAt) > 0, true);
+  await json(`${app}/api/entries`, { method: "PUT", headers, body: JSON.stringify({ entries: resurrectionSnapshot.entries }) });
+  assert.equal((await json(`${app}/api/webdav/sync`, { method: "POST", headers, body: "{}" })).status, "synced");
+  const resurrectedEnvelope = JSON.parse(webdavBody);
+  const resurrectedEntry = resurrectedEnvelope.entries.find((entry) => entry.id === created.entry.id);
+  assert.equal(Boolean(resurrectedEntry), true);
+  assert.equal(resurrectedEnvelope.tombstones.some((item) => item.id === created.entry.id), false);
+  assert.equal(Number(resurrectedEntry.updatedAt) > Number(deletion.updatedAt), true);
+  console.log("smoke ok: cancellation, correction, rewind, providers, word IPA/POS/forms, review, atomic local data, WebDAV sync");
 } finally {
   child.kill("SIGTERM");
   await close(mock);
+  await close(webdav);
   await rm(temp, { recursive: true, force: true });
 }

@@ -72,10 +72,13 @@ impl AiConfig {
 struct Backend {
     settings_path: PathBuf,
     library_path: PathBuf,
+    webdav_path: PathBuf,
     saved_config: Value,
+    webdav_config: Value,
     library: Value,
     library_serialized: String,
     client: reqwest::Client,
+    webdav_client: reqwest::Client,
 }
 
 struct AppState {
@@ -114,6 +117,32 @@ fn integer(value: Option<&Value>, fallback: u64) -> u64 {
 
 fn boolean(value: Option<&Value>, fallback: bool) -> bool {
     value.and_then(Value::as_bool).unwrap_or(fallback)
+}
+
+fn word_parts_of_speech(value: Option<&Value>) -> Vec<Value> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(6)
+        .map(|item| text(Some(item), 40))
+        .filter(|item| !item.is_empty())
+        .map(Value::String)
+        .collect()
+}
+
+fn word_forms(value: Option<&Value>) -> Vec<Value> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(8)
+        .filter_map(|item| {
+            let form = text(item.get("form"), 200);
+            let label = text(item.get("label"), 80);
+            (!form.is_empty() && !label.is_empty()).then(|| json!({"form":form,"label":label}))
+        })
+        .collect()
 }
 
 fn valid_id(value: Option<&Value>) -> String {
@@ -509,17 +538,19 @@ fn clean_entry(value: &Value) -> Option<Value> {
                 Some(json!({
                     "text": word_text,
                     "pronunciation": text(word.get("pronunciation"), 500),
-                    "meaning": text(word.get("meaning"), 1_000)
+                    "meaning": text(word.get("meaning"), 1_000),
+                    "partOfSpeech": word_parts_of_speech(word.get("partOfSpeech")),
+                    "forms": word_forms(word.get("forms"))
                 }))
             }
         })
         .collect::<Vec<_>>();
     if kind == "word" && words.is_empty() {
-        words.push(json!({"text":display_text.clone(),"pronunciation":pronunciation.clone(),"meaning":meaning.clone()}));
+        words.push(json!({"text":display_text.clone(),"pronunciation":pronunciation.clone(),"meaning":meaning.clone(),"partOfSpeech":[],"forms":[]}));
     } else if kind == "word_list" && words.is_empty() {
         words = word_parts(&display_text)
             .into_iter()
-            .map(|word| json!({"text":word,"pronunciation":"","meaning":""}))
+            .map(|word| json!({"text":word,"pronunciation":"","meaning":"","partOfSpeech":[],"forms":[]}))
             .collect();
     }
     let pronunciation = if pronunciation.is_empty() && kind == "word" {
@@ -616,6 +647,221 @@ fn normalize_base(value: &str) -> Result<String, String> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
+fn normalize_webdav_base(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value.trim()) else {
+        return String::new();
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return String::new();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let path = format!("{}/", url.path().trim_end_matches('/'));
+    url.set_path(if path == "//" { "/" } else { &path });
+    url.to_string()
+}
+
+fn normalize_webdav_path(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .map(str::trim)
+        .filter(|part| {
+            !part.is_empty()
+                && *part != "."
+                && *part != ".."
+                && !part.chars().any(|c| c.is_control())
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "shici/library.json".into()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn normalize_webdav_config(value: Value) -> Value {
+    let mut tombstones = serde_json::Map::new();
+    if let Some(items) = value.get("tombstones").and_then(Value::as_object) {
+        for (id, at) in items.iter().take(20_000) {
+            let timestamp = number(Some(at), 0.0);
+            let safe_id = !id.is_empty()
+                && id.len() <= 80
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+            if safe_id && timestamp > 0.0 {
+                tombstones.insert(id.clone(), json!(timestamp));
+            }
+        }
+    }
+    json!({
+        "version": 1,
+        "enabled": boolean(value.get("enabled"), false),
+        "baseUrl": normalize_webdav_base(&text(value.get("baseUrl"), 2_000)),
+        "username": text(value.get("username"), 500),
+        "password": text(value.get("password"), 2_000),
+        "remotePath": normalize_webdav_path(&text(value.get("remotePath"), 500)),
+        "etag": text(value.get("etag"), 500),
+        "lastHash": text(value.get("lastHash"), 128),
+        "lastSyncAt": number(value.get("lastSyncAt"), 0.0),
+        "lastStatus": text(value.get("lastStatus"), 40),
+        "lastError": text(value.get("lastError"), 1_000),
+        "tombstones": Value::Object(tombstones)
+    })
+}
+
+fn webdav_payload(value: &Value) -> Value {
+    let mut entries = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    entries.sort_by_key(|left| text(left.get("id"), 80));
+    let mut tombstones = value
+        .get("tombstones")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(id, at)| json!({"id":id,"updatedAt":number(Some(at),0.0)}))
+        .filter(|item| number(item.get("updatedAt"), 0.0) > 0.0)
+        .collect::<Vec<_>>();
+    tombstones.sort_by_key(|left| text(left.get("id"), 80));
+    json!({"format":"shici-sync","version":1,"entries":entries,"tombstones":tombstones})
+}
+
+fn webdav_hash(value: &Value) -> String {
+    let bytes = serde_json::to_vec(&webdav_payload(value)).unwrap_or_default();
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("{hash:016x}")
+}
+
+fn normalize_webdav_envelope(value: &Value) -> Value {
+    let entries = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(clean_entry)
+        .collect::<Vec<_>>();
+    let mut tombstones = serde_json::Map::new();
+    let source = value
+        .get("tombstones")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in source {
+        let id = text(item.get("id"), 80);
+        let at = number(item.get("updatedAt"), 0.0);
+        if !id.is_empty() && at > 0.0 {
+            tombstones
+                .entry(id)
+                .and_modify(|current| {
+                    if number(Some(current), 0.0) < at {
+                        *current = json!(at);
+                    }
+                })
+                .or_insert(json!(at));
+        }
+    }
+    for entry in &entries {
+        let id = text(entry.get("id"), 80);
+        if number(tombstones.get(&id), 0.0) <= number(entry.get("updatedAt"), 0.0) {
+            tombstones.remove(&id);
+        }
+    }
+    json!({"entries":entries,"tombstones":tombstones})
+}
+
+fn merge_webdav_envelopes(local: &Value, remote: &Value) -> Value {
+    let mut by_id = HashMap::new();
+    for entry in local
+        .get("entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        by_id.insert(text(entry.get("id"), 80), entry.clone());
+    }
+    for entry in remote
+        .get("entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = text(entry.get("id"), 80);
+        let current = by_id.get(&id);
+        if current.is_none()
+            || number(entry.get("updatedAt"), 0.0)
+                > number(current.and_then(|item| item.get("updatedAt")), 0.0)
+        {
+            by_id.insert(id, entry.clone());
+        }
+    }
+    let mut tombstones = local
+        .get("tombstones")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let (Some(target), Some(source)) = (
+        tombstones.as_object_mut(),
+        remote.get("tombstones").and_then(Value::as_object),
+    ) {
+        for (id, at) in source {
+            if number(target.get(id), 0.0) < number(Some(at), 0.0) {
+                target.insert(id.clone(), at.clone());
+            }
+        }
+    }
+    let entries = by_id
+        .into_values()
+        .filter(|entry| {
+            number(entry.get("updatedAt"), 0.0)
+                > number(tombstones.get(text(entry.get("id"), 80)), 0.0)
+        })
+        .collect::<Vec<_>>();
+    json!({"entries":entries,"tombstones":tombstones})
+}
+
+fn webdav_file_url(config: &Value) -> Result<String, String> {
+    let mut url = Url::parse(&text(config.get("baseUrl"), 2_000))
+        .map_err(|_| "WebDAV 根地址格式不正确".to_string())?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "WebDAV 地址不支持路径".to_string())?;
+        for part in normalize_webdav_path(&text(config.get("remotePath"), 500)).split('/') {
+            segments.push(part);
+        }
+    }
+    Ok(url.to_string())
+}
+
+fn webdav_folder_urls(config: &Value) -> Result<Vec<String>, String> {
+    let mut url = Url::parse(&text(config.get("baseUrl"), 2_000))
+        .map_err(|_| "WebDAV 根地址格式不正确".to_string())?;
+    let parts = normalize_webdav_path(&text(config.get("remotePath"), 500))
+        .split('/')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "WebDAV 地址不支持路径".to_string())?;
+        segments.push(part);
+        drop(segments);
+        result.push(url.to_string());
+    }
+    Ok(result)
+}
+
 fn normalize_reasoning_effort(value: Option<&Value>) -> String {
     match text(value, 16).as_str() {
         "none" | "low" | "medium" | "high" => text(value, 16),
@@ -673,7 +919,9 @@ impl Backend {
         fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
         let settings_path = data_dir.join("settings.json");
         let library_path = data_dir.join("library.json");
+        let webdav_path = data_dir.join("webdav.json");
         let saved_config = normalize_saved_config(read_json(&settings_path, json!({}))?);
+        let webdav_config = normalize_webdav_config(read_json(&webdav_path, json!({}))?);
         let source = read_json(&library_path, json!({"version": 2, "entries": []}))?;
         let entries = source
             .get("entries")
@@ -691,11 +939,18 @@ impl Backend {
         Ok(Self {
             settings_path,
             library_path,
+            webdav_path,
             saved_config,
+            webdav_config,
             library,
             library_serialized,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .map_err(|error| error.to_string())?,
+            webdav_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| error.to_string())?,
         })
@@ -851,6 +1106,304 @@ impl Backend {
         self.saved_config = json!({"version":2,"activeProviderId":active,"providers":providers});
         write_private_json(&self.settings_path, &self.saved_config)?;
         self.public_config()
+    }
+
+    fn public_webdav(&self) -> Value {
+        json!({
+            "enabled": boolean(self.webdav_config.get("enabled"), false),
+            "baseUrl": text(self.webdav_config.get("baseUrl"), 2_000),
+            "username": text(self.webdav_config.get("username"), 500),
+            "remotePath": text(self.webdav_config.get("remotePath"), 500),
+            "hasPassword": !text(self.webdav_config.get("password"), 2_000).is_empty(),
+            "lastSyncAt": number(self.webdav_config.get("lastSyncAt"), 0.0),
+            "lastStatus": text(self.webdav_config.get("lastStatus"), 40),
+            "lastError": text(self.webdav_config.get("lastError"), 1_000)
+        })
+    }
+
+    fn draft_webdav(&self, body: &Value) -> Result<Value, String> {
+        let base_url = normalize_webdav_base(&text(
+            body.get("baseUrl")
+                .or_else(|| self.webdav_config.get("baseUrl")),
+            2_000,
+        ));
+        if base_url.is_empty() {
+            return Err("WebDAV 根地址格式不正确".into());
+        }
+        let remote_path = normalize_webdav_path(&text(
+            body.get("remotePath")
+                .or_else(|| self.webdav_config.get("remotePath")),
+            500,
+        ));
+        if !remote_path.ends_with(".json") {
+            return Err("远端文件路径需要以 .json 结尾".into());
+        }
+        let password = text(body.get("password"), 2_000);
+        Ok(normalize_webdav_config(json!({
+            "version":1,
+            "enabled":boolean(body.get("enabled"), false),
+            "baseUrl":base_url,
+            "username":text(body.get("username").or_else(|| self.webdav_config.get("username")), 500),
+            "password":if password.is_empty() { text(self.webdav_config.get("password"), 2_000) } else { password },
+            "remotePath":remote_path,
+            "etag":text(self.webdav_config.get("etag"),500),
+            "lastHash":text(self.webdav_config.get("lastHash"),128),
+            "lastSyncAt":number(self.webdav_config.get("lastSyncAt"),0.0),
+            "lastStatus":text(self.webdav_config.get("lastStatus"),40),
+            "lastError":text(self.webdav_config.get("lastError"),1_000),
+            "tombstones":self.webdav_config.get("tombstones").cloned().unwrap_or_else(||json!({}))
+        })))
+    }
+
+    fn save_webdav_config(&mut self, body: &Value) -> Result<Value, String> {
+        self.webdav_config = self.draft_webdav(body)?;
+        write_private_json(&self.webdav_path, &self.webdav_config)?;
+        Ok(self.public_webdav())
+    }
+
+    fn mark_tombstone(&mut self, id: &str) {
+        if let Some(tombstones) = self
+            .webdav_config
+            .get_mut("tombstones")
+            .and_then(Value::as_object_mut)
+        {
+            tombstones.insert(id.to_string(), json!(now_ms()));
+        }
+    }
+
+    fn resurrect_tombstoned_entries(&mut self) -> bool {
+        let tombstones = self
+            .webdav_config
+            .get("tombstones")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut resurrected = Vec::new();
+        for entry in self.entries_mut() {
+            let id = text(entry.get("id"), 80);
+            let deleted_at = number(tombstones.get(&id), 0.0);
+            if deleted_at <= 0.0 {
+                continue;
+            }
+            entry["updatedAt"] = json!(number(entry.get("updatedAt"), 0.0).max(deleted_at + 1.0));
+            resurrected.push(id);
+        }
+        if let Some(tombstones) = self
+            .webdav_config
+            .get_mut("tombstones")
+            .and_then(Value::as_object_mut)
+        {
+            for id in &resurrected {
+                tombstones.remove(id);
+            }
+        }
+        !resurrected.is_empty()
+    }
+
+    async fn webdav_request(
+        &self,
+        config: &Value,
+        method: Method,
+        url: String,
+        headers: Vec<(&str, String)>,
+        body: Option<Vec<u8>>,
+    ) -> Result<reqwest::Response, String> {
+        let mut request = self.webdav_client.request(method, url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let username = text(config.get("username"), 500);
+        let password = text(config.get("password"), 2_000);
+        if !username.is_empty() || !password.is_empty() {
+            request = request.basic_auth(username, Some(password));
+        }
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("无法连接 WebDAV 服务：{error}"))?;
+        if response.status().is_redirection() {
+            return Err("WebDAV 地址发生重定向，请填写最终地址".into());
+        }
+        Ok(response)
+    }
+
+    fn webdav_error(status: u16, fallback: &str) -> String {
+        match status {
+            401 => "WebDAV 认证失败，请检查账号或密码".into(),
+            403 => "WebDAV 服务拒绝访问，请检查权限".into(),
+            404 => "WebDAV 路径不存在".into(),
+            _ => format!("{fallback}（{status}）"),
+        }
+    }
+
+    async fn test_webdav(&self, body: &Value) -> Result<Value, String> {
+        let config = self.draft_webdav(body)?;
+        let response = self.webdav_request(&config, Method::from_bytes(b"PROPFIND").unwrap(), text(config.get("baseUrl"), 2_000), vec![("Depth", "0".into()), ("Content-Type", "application/xml".into())], Some(b"<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><propname/></propfind>".to_vec())).await?;
+        let status = response.status().as_u16();
+        if !matches!(status, 200 | 207) {
+            return Err(Self::webdav_error(status, "WebDAV 连接测试失败"));
+        }
+        Ok(
+            json!({"ok":true,"status":status,"server":response.headers().get("server").and_then(|value|value.to_str().ok()).unwrap_or("")}),
+        )
+    }
+
+    async fn put_webdav(
+        &self,
+        config: &Value,
+        payload: &Value,
+        etag: &str,
+        missing: bool,
+    ) -> Result<String, String> {
+        for folder in webdav_folder_urls(config)? {
+            let response = self
+                .webdav_request(
+                    config,
+                    Method::from_bytes(b"MKCOL").unwrap(),
+                    folder,
+                    Vec::new(),
+                    None,
+                )
+                .await?;
+            let status = response.status().as_u16();
+            if !matches!(status, 200 | 201 | 204 | 405) {
+                return Err(Self::webdav_error(status, "无法创建 WebDAV 文件夹"));
+            }
+        }
+        let mut headers = vec![("Content-Type", "application/json; charset=utf-8".into())];
+        if missing {
+            headers.push(("If-None-Match", "*".into()));
+        } else if !etag.is_empty() {
+            headers.push(("If-Match", etag.into()));
+        }
+        let response = self
+            .webdav_request(
+                config,
+                Method::PUT,
+                webdav_file_url(config)?,
+                headers,
+                Some(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(payload).map_err(|error| error.to_string())?
+                    )
+                    .into_bytes(),
+                ),
+            )
+            .await?;
+        let status = response.status().as_u16();
+        if !matches!(status, 200 | 201 | 204) {
+            return Err(Self::webdav_error(status, "无法写入 WebDAV 同步文件"));
+        }
+        Ok(response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(etag)
+            .to_string())
+    }
+
+    async fn sync_webdav(&mut self) -> Result<Value, String> {
+        if !boolean(self.webdav_config.get("enabled"), false) {
+            return Ok(json!({"enabled":false,"status":"disabled","entries":self.entries()}));
+        }
+        let config = normalize_webdav_config(self.webdav_config.clone());
+        let local = normalize_webdav_envelope(
+            &json!({"entries":self.entries(),"tombstones":config["tombstones"]}),
+        );
+        let local_hash = webdav_hash(&local);
+        let etag = text(config.get("etag"), 500);
+        let mut headers = Vec::new();
+        if !etag.is_empty() {
+            headers.push(("If-None-Match", etag.clone()));
+        }
+        let response = self
+            .webdav_request(
+                &config,
+                Method::GET,
+                webdav_file_url(&config)?,
+                headers,
+                None,
+            )
+            .await?;
+        let status = response.status().as_u16();
+        let mut remote = None;
+        let mut remote_etag = etag;
+        let remote_missing = status == 404;
+        if status == 304 {
+            if text(config.get("lastHash"), 128) == local_hash {
+                let mut next = config.clone();
+                next["lastSyncAt"] = json!(now_ms());
+                next["lastStatus"] = json!("unchanged");
+                next["lastError"] = json!("");
+                self.webdav_config = next;
+                write_private_json(&self.webdav_path, &self.webdav_config)?;
+                return Ok(json!({"enabled":true,"status":"unchanged","entries":self.entries()}));
+            }
+        } else if status == 200 {
+            if response
+                .content_length()
+                .is_some_and(|length| length > 25 * 1024 * 1024)
+            {
+                return Err("远端同步文件超过 25 MB，已停止读取".into());
+            }
+            remote_etag = response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+            if bytes.len() > 25 * 1024 * 1024 {
+                return Err("远端同步文件超过 25 MB，已停止读取".into());
+            }
+            let value = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| "远端同步文件不是有效 JSON".to_string())?;
+            remote = Some(normalize_webdav_envelope(&value));
+        } else if !remote_missing {
+            return Err(Self::webdav_error(status, "无法读取 WebDAV 同步文件"));
+        }
+        let merged = remote.as_ref().map_or_else(
+            || local.clone(),
+            |value| merge_webdav_envelopes(&local, value),
+        );
+        let merged_payload = webdav_payload(&merged);
+        let local_payload = webdav_payload(&local);
+        if merged_payload != local_payload {
+            self.library = json!({"version":2,"entries":merged["entries"]});
+            self.library_serialized =
+                serde_json::to_string(&self.library).map_err(|error| error.to_string())?;
+            write_private_json(&self.library_path, &self.library)?;
+        }
+        let remote_payload = remote.as_ref().map(webdav_payload);
+        let needs_upload =
+            remote_missing || remote.is_none() || remote_payload.as_ref() != Some(&merged_payload);
+        if needs_upload {
+            remote_etag = self
+                .put_webdav(&config, &merged_payload, &remote_etag, remote_missing)
+                .await?;
+        }
+        let mut next = config;
+        next["etag"] = json!(remote_etag);
+        next["lastHash"] = json!(webdav_hash(&merged));
+        next["lastSyncAt"] = json!(now_ms());
+        next["lastStatus"] = json!(if needs_upload {
+            "synced"
+        } else if remote.is_some() {
+            "merged"
+        } else {
+            "unchanged"
+        });
+        next["lastError"] = json!("");
+        next["tombstones"] = merged["tombstones"].clone();
+        self.webdav_config = next;
+        write_private_json(&self.webdav_path, &self.webdav_config)?;
+        Ok(
+            json!({"enabled":true,"status":text(self.webdav_config.get("lastStatus"),40),"entries":self.entries(),"lastSyncAt":self.webdav_config["lastSyncAt"]}),
+        )
     }
 
     fn entries(&self) -> &Vec<Value> {
@@ -1030,7 +1583,8 @@ impl Backend {
                         .unwrap_or(Value::Null);
                     clean_entry(&json!({
                         "id":Uuid::new_v4().to_string(), "raw":raw, "kind":"word", "words":[{
-                            "text":word_text, "pronunciation":pronunciation, "meaning":meaning
+                            "text":word_text, "pronunciation":pronunciation, "meaning":meaning,
+                            "partOfSpeech":word_parts_of_speech(word.get("partOfSpeech")), "forms":word_forms(word.get("forms"))
                         }], "displayText":word_text, "correction":correction, "pronunciation":pronunciation,
                         "meaning":meaning, "context":context, "usage":usage, "difficulty":difficulty, "chunks":[],
                         "source":source.clone(), "status":"review", "starred":false, "createdAt":created, "updatedAt":created,
@@ -1285,6 +1839,8 @@ impl Backend {
             .position(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
             .ok_or("没有找到这个片段")?;
         self.entries_mut().remove(index);
+        self.mark_tombstone(id);
+        write_private_json(&self.webdav_path, &self.webdav_config)?;
         self.save_library()?;
         Ok(json!({"deleted":true}))
     }
@@ -1298,7 +1854,24 @@ impl Backend {
             .take(10_000)
             .filter_map(clean_entry)
             .collect::<Vec<_>>();
+        let previous_ids = self
+            .entries()
+            .iter()
+            .map(|entry| text(entry.get("id"), 80))
+            .collect::<Vec<_>>();
         self.library = json!({"version":2,"entries":entries});
+        let next_ids = self
+            .entries()
+            .iter()
+            .map(|entry| text(entry.get("id"), 80))
+            .collect::<std::collections::HashSet<_>>();
+        for id in previous_ids {
+            if !next_ids.contains(&id) {
+                self.mark_tombstone(&id);
+            }
+        }
+        self.resurrect_tombstoned_entries();
+        write_private_json(&self.webdav_path, &self.webdav_config)?;
         self.save_library()?;
         Ok(self.library.clone())
     }
@@ -1365,6 +1938,9 @@ impl Backend {
         let mut merged = additions.clone();
         merged.extend(self.entries().iter().cloned());
         self.library = json!({"version":2,"entries":merged});
+        if self.resurrect_tombstoned_entries() {
+            write_private_json(&self.webdav_path, &self.webdav_config)?;
+        }
         self.save_library()?;
         Ok(json!({
             "version": 2,
@@ -1388,6 +1964,18 @@ impl Backend {
         }
         if path == "/api/config" && method == "PUT" {
             return Ok((200, self.save_config(&request.body)?));
+        }
+        if path == "/api/webdav" && method == "GET" {
+            return Ok((200, self.public_webdav()));
+        }
+        if path == "/api/webdav" && method == "PUT" {
+            return Ok((200, self.save_webdav_config(&request.body)?));
+        }
+        if path == "/api/webdav/test" && method == "POST" {
+            return Ok((200, self.test_webdav(&request.body).await?));
+        }
+        if path == "/api/webdav/sync" && method == "POST" {
+            return Ok((200, self.sync_webdav().await?));
         }
         if path == "/api/models" && method == "POST" {
             return Ok((200, self.list_models(&request.body).await?));
@@ -1700,7 +2288,7 @@ fn response_schema(payload: &Value) -> Value {
             "name": "shici_entry",
             "schema": {"type":"object","additionalProperties":false,"properties":{
                 "type":{"type":"string"},"kind":{"type":"string","enum":["word","word_list","phrase","sentence","other"]},"displayText":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},"difficulty":{"type":"number","minimum":1,"maximum":5},
-                "words":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"original":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},"usage":{"type":"array","items":{"type":"string"}},"difficulty":{"type":"number","minimum":1,"maximum":5}},"required":["text","original","correction","pronunciation","meaning","context","usage","difficulty"]}},
+                "words":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"original":{"type":"string"},"correction":{"type":"string"},"pronunciation":{"type":"string"},"meaning":{"type":"string"},"context":{"type":"string"},"usage":{"type":"array","items":{"type":"string"}},"partOfSpeech":{"type":"array","items":{"type":"string"}},"forms":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"form":{"type":"string"},"label":{"type":"string"}},"required":["form","label"]}},"difficulty":{"type":"number","minimum":1,"maximum":5}},"required":["text","original","correction","pronunciation","meaning","context","usage","partOfSpeech","forms","difficulty"]}},
                 "usage":{"type":"array","items":{"type":"string"}},"chunks":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"},"meaning":{"type":"string"}},"required":["text","meaning"]}},"memoryCue":{"type":"string"}
             },"required":["type","kind","displayText","correction","pronunciation","meaning","context","difficulty","words","usage","chunks","memoryCue"]}
         })
@@ -2210,6 +2798,34 @@ mod tests {
         assert_eq!(capitalize_word("URL"), "URL");
         assert_eq!(capitalize_word(""), "");
         assert_eq!(capitalize_word("日本語"), "日本語");
+    }
+
+    #[test]
+    fn resurrected_entries_win_over_remote_tombstones() {
+        let data_dir = std::env::temp_dir().join(format!("shici-resurrection-{}", Uuid::new_v4()));
+        let mut backend = Backend::new(data_dir.clone()).unwrap();
+        backend.library = json!({"version":2,"entries":[{
+            "id":"restored-entry","raw":"restored","displayText":"Restored",
+            "kind":"word","meaning":"恢复的","updatedAt":100
+        }]});
+        backend.webdav_config["tombstones"] = json!({"restored-entry":200});
+
+        assert!(backend.resurrect_tombstoned_entries());
+        assert_eq!(backend.library["entries"][0]["updatedAt"], json!(201.0));
+        assert!(backend.webdav_config["tombstones"]
+            .get("restored-entry")
+            .is_none());
+
+        let local =
+            json!({"entries":backend.entries(),"tombstones":backend.webdav_config["tombstones"]});
+        let remote = json!({"entries":[],"tombstones":{"restored-entry":200}});
+        let merged = merge_webdav_envelopes(&local, &remote);
+        assert!(merged["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == "restored-entry"));
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     #[test]

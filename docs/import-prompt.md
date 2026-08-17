@@ -9,7 +9,7 @@
 
 整理规则：
 1. 每个独立学习目标一个 entry。一个单词一个 entry；用户一次列出的多个互不相关单词必须拆成多个 entry。固定搭配、短语和完整句子保持为一个 entry，不要按空格拆开。
-2. raw 必须尽量保留用户当时发送的原文。只存在明显拼写错误时，displayText 才使用纠正后的文本，并在 correction 写成“原词 → 正词”。语法改写、词形还原、大小写规范不算拼写纠错。
+2. raw 必须尽量保留用户当时发送的原文。明显拼写错误时，displayText 使用纠正后的文本，并在 correction 写成“原词 → 正词”。对于孤立例句，如果改成一般现在时不会改变核心含义，可以把 displayText 归一为更适合记忆的通用形式，并在 correction 标明“was → is（通用时态）”；原始时态、叙事顺序、历史事实、引语或条件语义重要时保持原样。
 3. kind 只能是 word、phrase、sentence、other。独立单词为 word；两个或以上互相构成含义的词为 phrase；完整表达或句子为 sentence。
 4. 单个单词必须填写 IPA 音标（pronunciation），短语、句子和 other 的 pronunciation 留空字符串。
 5. meaning 写当前语境下自然、简洁的中文含义；context 写这个片段在原对话中的语境、语气或易混点；usage 放 0 到 3 条带中文翻译的例句；chunks 放 0 到 4 个值得单独记忆的表达拆解。
@@ -33,16 +33,20 @@
   "difficulty": 1.0
 }
 
-单词 entry 还应附带一个 words 数组，数组中只有一个对象：
+单词 entry 还应附带一个 words 数组，数组中只有一个对象。每个独立单词都必须提供词性和有代表性的特殊词形；没有值得单独记忆的词形时使用空数组：
 {
   "text": "展示用单词",
   "original": "原始单词；没有纠错时与 text 相同",
   "correction": "原词 → 正词，若无则为空字符串",
   "pronunciation": "IPA",
-  "meaning": "中文释义"
+  "meaning": "中文释义",
+  "partOfSpeech": ["名词"],
+  "forms": [{"form":"ropes","label":"复数"}]
 }
 
-phrase、sentence、other 的 words 必须是空数组。不要把多个独立单词放进一个 word_list entry；必须输出多个 word entry。
+partOfSpeech 应列出当前常用义项对应的中文词性（如“名词”“动词”“形容词”）；forms 只写有助于记忆的确切形式，并标注“复数”“过去式”“过去分词”“现在分词/进行时”等。phrase、sentence、other 的 words 必须是空数组。
+
+不要把多个独立单词放进同一个 entry；必须输出多个 word entry。
 
 输出前自检：
 - JSON 可以被标准解析器读取；

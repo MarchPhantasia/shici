@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
 import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveDataRoot } from "./scripts/data-root.mjs";
@@ -12,6 +12,7 @@ const dataRoot = process.env.SHICI_DATA_DIR || resolveDataRoot();
 const legacyDataRoot = join(appRoot, ".local");
 const settingsPath = process.env.AI_SETTINGS_PATH || join(dataRoot, "settings.json");
 const libraryPath = process.env.SHICI_DATA_PATH || join(dataRoot, "library.json");
+const webdavPath = join(dirname(libraryPath), "webdav.json");
 const port = Number(process.env.PORT || 4173);
 const envBaseUrl = process.env.AI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 const envConfig = {
@@ -57,7 +58,7 @@ const responseSchemas = {
       type: { type: "string" }, kind: { type: "string", enum: ["word", "word_list", "phrase", "sentence", "other"] },
       displayText: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" },
       meaning: { type: "string" }, context: { type: "string" }, difficulty: { type: "number", minimum: 1, maximum: 5 },
-      words: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, original: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" }, meaning: { type: "string" }, context: { type: "string" }, usage: { type: "array", items: { type: "string" } }, difficulty: { type: "number", minimum: 1, maximum: 5 } }, required: ["text", "original", "correction", "pronunciation", "meaning", "context", "usage", "difficulty"] } },
+      words: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, original: { type: "string" }, correction: { type: "string" }, pronunciation: { type: "string" }, meaning: { type: "string" }, context: { type: "string" }, usage: { type: "array", items: { type: "string" } }, partOfSpeech: { type: "array", items: { type: "string" } }, forms: { type: "array", items: { type: "object", additionalProperties: false, properties: { form: { type: "string" }, label: { type: "string" } }, required: ["form", "label"] } }, difficulty: { type: "number", minimum: 1, maximum: 5 } }, required: ["text", "original", "correction", "pronunciation", "meaning", "context", "usage", "partOfSpeech", "forms", "difficulty"] } },
       usage: { type: "array", items: { type: "string" } },
       chunks: { type: "array", items: { type: "object", additionalProperties: false, properties: { text: { type: "string" }, meaning: { type: "string" } }, required: ["text", "meaning"] } },
       memoryCue: { type: "string" },
@@ -76,6 +77,7 @@ let savedConfig = normalizeSavedConfig(await loadSavedConfig());
 let library = await loadLibrary();
 let libraryWrite = Promise.resolve();
 let librarySerialized = JSON.stringify(library);
+let webdavConfig = normalizeWebdavConfig(await loadWebdavConfig());
 const providerCapabilities = new Map();
 
 async function loadSavedConfig() {
@@ -278,9 +280,11 @@ function cleanEntry(value = {}) {
     text: capitalizeWord(cleanText(word?.text, 200)),
     pronunciation: cleanText(word?.pronunciation, 500),
     meaning: cleanText(word?.meaning, 1_000),
+    partOfSpeech: Array.isArray(word?.partOfSpeech) ? word.partOfSpeech.slice(0, 6).map((item) => cleanText(item, 40)).filter(Boolean) : [],
+    forms: Array.isArray(word?.forms) ? word.forms.slice(0, 8).map((form) => ({ form: cleanText(form?.form, 200), label: cleanText(form?.label, 80) })).filter((form) => form.form && form.label) : [],
   })).filter((word) => word.text) : [];
-  if (kind === "word" && !words.length) words = [{ text: displayText, pronunciation, meaning }];
-  if (kind === "word_list" && !words.length) words = wordParts(displayText).map((text) => ({ text, pronunciation: "", meaning: "" }));
+  if (kind === "word" && !words.length) words = [{ text: displayText, pronunciation, meaning, partOfSpeech: [], forms: [] }];
+  if (kind === "word_list" && !words.length) words = wordParts(displayText).map((text) => ({ text, pronunciation: "", meaning: "", partOfSpeech: [], forms: [] }));
   const baseConclusion = cleanText(value.baseConclusion || value.meaning || value.conclusion, 2_000);
   const context = cleanText(value.context);
   const usage = Array.isArray(value.usage) ? value.usage.slice(0, 3).map((item) => cleanText(item, 1_000)).filter(Boolean) : [];
@@ -357,16 +361,285 @@ function saveLibrary(change) {
   const operation = libraryWrite.then(async () => {
     const next = structuredClone(library);
     const result = change(next.entries);
+    const previousIds = new Set(library.entries.map((entry) => entry.id));
+    const nextIds = new Set(next.entries.map((entry) => entry.id));
+    const deletedIds = [...previousIds].filter((id) => !nextIds.has(id));
+    let webdavChanged = false;
+    for (const entry of next.entries) {
+      const deletedAt = Number(webdavConfig.tombstones[entry.id]) || 0;
+      if (!deletedAt) continue;
+      entry.updatedAt = Math.max(Number(entry.updatedAt) || 0, deletedAt + 1);
+      delete webdavConfig.tombstones[entry.id];
+      webdavChanged = true;
+    }
     const serialized = JSON.stringify(next);
     if (serialized !== librarySerialized) {
       await writePrivateJson(libraryPath, next);
       librarySerialized = serialized;
+    }
+    if (deletedIds.length) {
+      const deletedAt = Date.now();
+      for (const id of deletedIds) webdavConfig.tombstones[id] = deletedAt;
+      webdavChanged = true;
+    }
+    if (webdavChanged) {
+      await writePrivateJson(webdavPath, webdavConfig);
     }
     library = next;
     return structuredClone(result);
   });
   libraryWrite = operation.catch(() => {});
   return operation;
+}
+
+const MAX_WEBDAV_BYTES = 25 * 1024 * 1024;
+
+async function loadWebdavConfig() {
+  try { return JSON.parse(await readFile(webdavPath, "utf8")); }
+  catch (error) {
+    if (error.code === "ENOENT") return {};
+    console.warn(`无法读取 WebDAV 配置：${error.message}`);
+    return {};
+  }
+}
+
+function normalizeWebdavBaseUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return "";
+    url.search = "";
+    url.hash = "";
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/`;
+    return url.toString();
+  } catch { return ""; }
+}
+
+function normalizeWebdavPath(value) {
+  const parts = cleanText(value, 500).replaceAll("\\", "/").split("/").map((part) => part.trim()).filter(Boolean);
+  const safe = parts.filter((part) => part !== "." && part !== ".." && ![...part].some((char) => char.charCodeAt(0) < 32));
+  return safe.length ? safe.join("/") : "shici/library.json";
+}
+
+function normalizeWebdavConfig(value = {}) {
+  const tombstones = {};
+  const source = value.tombstones && typeof value.tombstones === "object" ? value.tombstones : {};
+  for (const [id, at] of Object.entries(source).slice(0, 20_000)) {
+    if (/^[\w-]{1,80}$/.test(id) && Number(at) > 0) tombstones[id] = Number(at);
+  }
+  return {
+    version: 1,
+    enabled: Boolean(value.enabled),
+    baseUrl: normalizeWebdavBaseUrl(value.baseUrl),
+    username: cleanText(value.username, 500),
+    password: cleanText(value.password, 2_000),
+    remotePath: normalizeWebdavPath(value.remotePath),
+    etag: cleanText(value.etag, 500),
+    lastHash: cleanText(value.lastHash, 128),
+    lastSyncAt: Number(value.lastSyncAt) || 0,
+    lastStatus: cleanText(value.lastStatus, 40),
+    lastError: cleanText(value.lastError, 1_000),
+    tombstones,
+  };
+}
+
+function publicWebdavConfig() {
+  return {
+    enabled: webdavConfig.enabled,
+    baseUrl: webdavConfig.baseUrl,
+    username: webdavConfig.username,
+    remotePath: webdavConfig.remotePath,
+    hasPassword: Boolean(webdavConfig.password),
+    lastSyncAt: webdavConfig.lastSyncAt,
+    lastStatus: webdavConfig.lastStatus,
+    lastError: webdavConfig.lastError,
+  };
+}
+
+function draftWebdavConfig(body = {}) {
+  const baseUrl = normalizeWebdavBaseUrl(body.baseUrl ?? webdavConfig.baseUrl);
+  if (!baseUrl) throw new ApiError("WebDAV 根地址格式不正确", 400);
+  const remotePath = normalizeWebdavPath(body.remotePath ?? webdavConfig.remotePath);
+  if (!remotePath.endsWith(".json")) throw new ApiError("远端文件路径需要以 .json 结尾", 400);
+  return normalizeWebdavConfig({
+    ...webdavConfig,
+    enabled: Boolean(body.enabled),
+    baseUrl,
+    username: cleanText(body.username ?? webdavConfig.username, 500),
+    password: String(body.password || "").trim() || webdavConfig.password,
+    remotePath,
+  });
+}
+
+function webdavFileUrl(config) {
+  const url = new URL(config.baseUrl);
+  url.pathname += config.remotePath.split("/").map((part) => encodeURIComponent(part)).join("/");
+  return url.toString();
+}
+
+function webdavFolderUrls(config) {
+  const parts = config.remotePath.split("/").slice(0, -1);
+  const url = new URL(config.baseUrl);
+  return parts.map((part) => {
+    url.pathname += `${encodeURIComponent(part)}/`;
+    return url.toString();
+  });
+}
+
+function webdavHeaders(config, extra = {}) {
+  const headers = { ...extra };
+  if (config.username || config.password) headers.Authorization = `Basic ${Buffer.from(`${config.username}:${config.password}`).toString("base64")}`;
+  return headers;
+}
+
+async function webdavRequest(config, url, options = {}) {
+  let response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      redirect: "manual",
+      signal: options.signal || AbortSignal.timeout(15_000),
+      headers: webdavHeaders(config, options.headers),
+    });
+  } catch (error) {
+    throw new ApiError(`无法连接 WebDAV 服务：${error.message}`, 502);
+  }
+  if ([301, 302, 303, 307, 308].includes(response.status)) throw new ApiError("WebDAV 地址发生重定向，请填写最终地址", 502);
+  return response;
+}
+
+function webdavError(response, fallback = "WebDAV 请求失败") {
+  if (response.status === 401) return new ApiError("WebDAV 认证失败，请检查账号或密码", 502);
+  if (response.status === 403) return new ApiError("WebDAV 服务拒绝访问，请检查权限", 502);
+  if (response.status === 404) return new ApiError("WebDAV 路径不存在", 502);
+  return new ApiError(`${fallback}（${response.status}）`, 502);
+}
+
+async function readWebdavJson(response) {
+  const length = Number(response.headers.get("content-length"));
+  if (Number.isFinite(length) && length > MAX_WEBDAV_BYTES) throw new ApiError("远端同步文件超过 25 MB，已停止读取", 413);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > MAX_WEBDAV_BYTES) throw new ApiError("远端同步文件超过 25 MB，已停止读取", 413);
+  try { return JSON.parse(new TextDecoder().decode(bytes)); }
+  catch { throw new ApiError("远端同步文件不是有效 JSON", 502); }
+}
+
+function webdavPayload(value) {
+  const entries = [...(value.entries || [])].sort((left, right) => String(left.id).localeCompare(String(right.id)));
+  const tombstones = Object.entries(value.tombstones || {})
+    .map(([id, updatedAt]) => ({ id, updatedAt: Number(updatedAt) || 0 }))
+    .filter((item) => item.id && item.updatedAt > 0)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  return { format: "shici-sync", version: 1, entries, tombstones };
+}
+
+function webdavHash(value) {
+  return createHash("sha256").update(JSON.stringify(webdavPayload(value))).digest("hex");
+}
+
+function normalizeWebdavEnvelope(value = {}) {
+  const entries = Array.isArray(value.entries) ? value.entries.map(cleanEntry).filter((entry) => entry.raw) : [];
+  const tombstones = {};
+  const source = Array.isArray(value.tombstones) ? value.tombstones : Object.entries(value.tombstones || {}).map(([id, updatedAt]) => ({ id, updatedAt }));
+  for (const item of source.slice(0, 20_000)) {
+    const id = cleanText(item?.id, 80);
+    const updatedAt = Number(item?.updatedAt) || 0;
+    if (/^[\w-]{1,80}$/.test(id) && updatedAt > 0) tombstones[id] = Math.max(tombstones[id] || 0, updatedAt);
+  }
+  for (const entry of entries) if (tombstones[entry.id] <= Number(entry.updatedAt)) delete tombstones[entry.id];
+  return { entries, tombstones };
+}
+
+function mergeWebdavEnvelopes(local, remote) {
+  const byId = new Map(local.entries.map((entry) => [entry.id, entry]));
+  for (const entry of remote.entries) {
+    const current = byId.get(entry.id);
+    if (!current || Number(entry.updatedAt) > Number(current.updatedAt)) byId.set(entry.id, entry);
+  }
+  const tombstones = { ...local.tombstones };
+  for (const [id, updatedAt] of Object.entries(remote.tombstones)) tombstones[id] = Math.max(tombstones[id] || 0, updatedAt);
+  const entries = [...byId.values()].filter((entry) => Number(entry.updatedAt) > (tombstones[entry.id] || 0));
+  for (const id of Object.keys(tombstones)) if (entries.some((entry) => entry.id === id && Number(entry.updatedAt) > tombstones[id])) delete tombstones[id];
+  return { entries, tombstones };
+}
+
+async function testWebdav(body = {}) {
+  const config = draftWebdavConfig({ ...body, enabled: false });
+  const response = await webdavRequest(config, config.baseUrl, {
+    method: "PROPFIND",
+    headers: { Depth: "0", "Content-Type": "application/xml" },
+    body: "<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><propname/></propfind>",
+  });
+  if (![200, 207].includes(response.status)) throw webdavError(response, "WebDAV 连接测试失败");
+  return { ok: true, status: response.status, server: response.headers.get("server") || "" };
+}
+
+async function saveWebdavConfig(body = {}) {
+  webdavConfig = draftWebdavConfig(body);
+  await writePrivateJson(webdavPath, webdavConfig);
+  return publicWebdavConfig();
+}
+
+async function putWebdav(config, payload, etag, missing) {
+  for (const folderUrl of webdavFolderUrls(config)) {
+    const folderResponse = await webdavRequest(config, folderUrl, { method: "MKCOL" });
+    if (![200, 201, 204, 405].includes(folderResponse.status)) throw webdavError(folderResponse, "无法创建 WebDAV 文件夹");
+  }
+  const headers = { "Content-Type": "application/json; charset=utf-8" };
+  if (missing) headers["If-None-Match"] = "*";
+  else if (etag) headers["If-Match"] = etag;
+  const response = await webdavRequest(config, webdavFileUrl(config), { method: "PUT", headers, body: `${JSON.stringify(payload, null, 2)}\n` });
+  if (![200, 201, 204].includes(response.status)) throw webdavError(response, "无法写入 WebDAV 同步文件");
+  return response.headers.get("etag") || etag || "";
+}
+
+async function syncWebdav(options = {}) {
+  if (!webdavConfig.enabled) return { ...publicWebdavConfig(), status: "disabled", entries: library.entries };
+  await libraryWrite;
+  const config = normalizeWebdavConfig(webdavConfig);
+  const local = normalizeWebdavEnvelope({ entries: library.entries, tombstones: config.tombstones });
+  const localHash = webdavHash(local);
+  let remote = null;
+  let remoteEtag = config.etag;
+  let remoteMissing = false;
+  try {
+    const response = await webdavRequest(config, webdavFileUrl(config), { method: "GET", headers: config.etag ? { "If-None-Match": config.etag } : {} });
+    if (response.status === 304) {
+      if (config.lastHash !== localHash) remote = null;
+    } else if (response.status === 404) {
+      remoteMissing = true;
+    } else if (response.status === 200) {
+      remote = normalizeWebdavEnvelope(await readWebdavJson(response));
+      remoteEtag = response.headers.get("etag") || "";
+    } else throw webdavError(response, "无法读取 WebDAV 同步文件");
+    if (!remoteMissing && !remote && config.lastHash === localHash) {
+      webdavConfig = { ...config, lastSyncAt: Date.now(), lastStatus: "unchanged", lastError: "" };
+      await writePrivateJson(webdavPath, webdavConfig);
+      return { ...publicWebdavConfig(), status: "unchanged", entries: library.entries };
+    }
+    let merged = remote ? mergeWebdavEnvelopes(local, remote) : local;
+    const mergedPayload = webdavPayload(merged);
+    const remotePayload = remote ? webdavPayload(remote) : null;
+    const mergedHash = webdavHash(merged);
+    if (JSON.stringify(mergedPayload) !== JSON.stringify(webdavPayload(local))) {
+      const next = { version: 2, entries: merged.entries };
+      const serialized = JSON.stringify(next);
+      if (serialized !== librarySerialized) {
+        await writePrivateJson(libraryPath, next);
+        library = next;
+        librarySerialized = serialized;
+      }
+      webdavConfig.tombstones = merged.tombstones;
+    }
+    const needsUpload = remoteMissing || !remote || JSON.stringify(remotePayload) !== JSON.stringify(mergedPayload);
+    if (needsUpload) remoteEtag = await putWebdav(config, mergedPayload, remoteEtag, remoteMissing);
+    webdavConfig = { ...config, etag: remoteEtag, lastHash: mergedHash, lastSyncAt: Date.now(), lastStatus: needsUpload ? "synced" : "merged", lastError: "", tombstones: merged.tombstones };
+    await writePrivateJson(webdavPath, webdavConfig);
+    return { ...publicWebdavConfig(), status: webdavConfig.lastStatus, entries: library.entries };
+  } catch (error) {
+    webdavConfig = { ...config, lastSyncAt: Date.now(), lastStatus: "error", lastError: error.message || "同步失败" };
+    await writePrivateJson(webdavPath, webdavConfig).catch(() => {});
+    throw error;
+  }
 }
 
 function normalizeApiBase(value) {
@@ -752,7 +1025,13 @@ async function createEntry(body, signal) {
       const usage = Array.isArray(word?.usage) && word.usage.length ? word.usage : result.usage;
       return cleanEntry({
         id: randomUUID(), raw, displayText: text, kind: "word",
-        words: [{ text, pronunciation: cleanText(word?.pronunciation, 500), meaning }],
+        words: [{
+          text,
+          pronunciation: cleanText(word?.pronunciation, 500),
+          meaning,
+          partOfSpeech: Array.isArray(word?.partOfSpeech) ? word.partOfSpeech : [],
+          forms: Array.isArray(word?.forms) ? word.forms : [],
+        }],
         correction: normalizeWordCorrection(raw, text, word?.correction),
         pronunciation: cleanText(word?.pronunciation, 500), meaning,
         context, usage, chunks: [], source: payload.source,
@@ -1012,7 +1291,7 @@ function trustedApiRequest(request) {
 function errorStatus(error) {
   const message = error?.message || "";
   if (Number.isInteger(error?.status)) return error.status;
-  if (/请输入|格式不正确|Base URL|请.*填写|没有找到/.test(message)) {
+  if (/请输入|格式不正确|Base URL|WebDAV 根地址|远端文件路径|请.*填写|没有找到/.test(message)) {
     return /没有找到/.test(message) ? 404 : 400;
   }
   return 502;
@@ -1034,6 +1313,22 @@ async function handleApi(request, response, pathname) {
     }
     if (pathname === "/api/config" && request.method === "PUT") {
       sendJson(response, 200, await saveConfig(await readJson(request)));
+      return true;
+    }
+    if (pathname === "/api/webdav" && request.method === "GET") {
+      sendJson(response, 200, publicWebdavConfig());
+      return true;
+    }
+    if (pathname === "/api/webdav" && request.method === "PUT") {
+      sendJson(response, 200, await saveWebdavConfig(await readJson(request)));
+      return true;
+    }
+    if (pathname === "/api/webdav/test" && request.method === "POST") {
+      sendJson(response, 200, await testWebdav(await readJson(request)));
+      return true;
+    }
+    if (pathname === "/api/webdav/sync" && request.method === "POST") {
+      sendJson(response, 200, await syncWebdav({ manual: true }));
       return true;
     }
     const providerMatch = pathname.match(/^\/api\/config\/([\w-]+)$/);

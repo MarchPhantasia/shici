@@ -7,7 +7,7 @@
     <meta name="description" content="拾词：捕捉并理解散落在任何场景里的语言片段。" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=23" />
+    <link rel="stylesheet" href="/styles.css?v=27" />
     <title>拾词</title>
   </head>
   <body>
@@ -92,15 +92,31 @@
                 <h1 id="view-title">词库</h1>
                 <p id="view-subtitle">散落在不同场景里的语言片段</p>
               </div>
-              <label class="library-filter">
-                <span>筛选</span>
-                <select id="library-filter-select" aria-label="筛选词库">
-                  <option value="all">全部</option>
-                  <option value="starred">收藏</option>
-                </select>
-              </label>
+              <div class="library-controls">
+                <label class="library-filter">
+                  <span>筛选</span>
+                  <select id="library-filter-select" aria-label="筛选词库">
+                    <option value="all">全部</option>
+                    <option value="starred">收藏</option>
+                  </select>
+                </label>
+                <label class="library-filter">
+                  <span>排序</span>
+                  <select id="library-sort-select" aria-label="排序词库">
+                    <option value="recent">最近添加</option>
+                    <option value="due">复习优先</option>
+                    <option value="difficulty-desc">难度从高到低</option>
+                    <option value="difficulty-asc">难度从低到高</option>
+                    <option value="alpha">按字母</option>
+                    <option value="oldest">最早添加</option>
+                    <option value="source">按来源</option>
+                  </select>
+                </label>
+              </div>
               <span id="star-count" hidden>0</span>
             </section>
+
+            <section class="new-entry-notice" id="new-entry-notice" aria-live="polite" hidden></section>
 
             <section class="timeline" id="timeline"></section>
           </section>
@@ -251,6 +267,30 @@
         <div class="setting-row"><div><strong>本地片段库</strong><p>解释、来源、复习状态与追问均保存在本机</p></div><span id="settings-count">0</span></div>
         <p class="field-help import-help">批量文件会追加到现有词库，重复内容自动跳过。格式见项目中的 docs/import-prompt.md。</p>
       </div>
+      <form id="webdav-form" class="settings-list webdav-settings">
+        <div class="settings-section-title"><h3>WebDAV 同步</h3><span class="status-pill" id="webdav-status-pill">未配置</span></div>
+        <p class="field-help webdav-intro">只同步词库、复习状态、收藏和追问，不上传 AI Provider、API Key 或外观设置。</p>
+        <label class="setting-field">
+          <span>WebDAV 根地址</span>
+          <input id="webdav-base-url" type="url" placeholder="https://dav.example.com/dav/" autocomplete="url" spellcheck="false" />
+        </label>
+        <div class="webdav-grid">
+          <label class="setting-field"><span>用户名</span><input id="webdav-username" type="text" autocomplete="username" /></label>
+          <label class="setting-field"><span>密码</span><input id="webdav-password" type="password" placeholder="留空则保留已保存密码" autocomplete="current-password" /></label>
+        </div>
+        <label class="setting-field">
+          <span>同步文件路径</span>
+          <input id="webdav-remote-path" type="text" value="shici/library.json" placeholder="shici/library.json" autocomplete="off" spellcheck="false" />
+          <small class="field-help">使用同一个文件合并多台设备；内容按记录更新时间合并，删除也会同步。</small>
+        </label>
+        <label class="checkbox-row"><input id="webdav-enabled" type="checkbox" /><span>保存后自动同步</span></label>
+        <div class="webdav-actions">
+          <span class="config-message" id="webdav-message" role="status" aria-live="polite"></span>
+          <button class="secondary-button" id="webdav-test" type="button"><i data-lucide="plug-zap"></i>测试连接</button>
+          <button class="primary-button" id="webdav-save" type="submit"><i data-lucide="cloud"></i>保存配置</button>
+          <button class="secondary-button" id="webdav-sync" type="button"><i data-lucide="refresh-cw"></i>立即同步</button>
+        </div>
+      </form>
       <div class="dialog-actions">
         <button class="secondary-button" type="button" data-action="export"><i data-lucide="download"></i>导出 JSON</button>
         <button class="secondary-button" type="button" data-action="import"><i data-lucide="upload"></i>追加导入 JSON</button>
@@ -273,6 +313,6 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script src="/vendor/lucide.min.js?v=19"></script>
-    <script type="module" src="/app.js?v=26"></script>
+    <script type="module" src="/app.js?v=30"></script>
   </body>
 </html>
