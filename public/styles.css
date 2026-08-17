@@ -247,27 +247,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .send-button.stop { background: var(--rose); }
 .send-button.stop:hover { background: var(--rose); }
 .send-button svg { width: 16px; height: 16px; }
-.context-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 36px;
-  padding: 4px 6px 4px 11px;
-  border: 1px solid color-mix(in srgb, var(--teal) 50%, var(--border));
-  border-bottom: 0;
-  border-radius: var(--radius) var(--radius) 0 0;
-  background: var(--teal-soft);
-  color: var(--teal);
-  font-size: 12px;
-  animation: context-in 180ms ease both;
-}
-.context-bar:not([hidden]) + .composer { border-top-color: color-mix(in srgb, var(--teal) 50%, var(--border)); border-radius: 0 0 var(--radius) var(--radius); }
-.context-copy, .context-actions { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.context-copy strong { max-width: min(46vw, 420px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pulse-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
-.context-bar .icon-button { width: 28px; height: 28px; border: 0; background: transparent; color: var(--teal); }
 .text-button { min-height: 28px; padding: 0 8px; border: 1px solid color-mix(in srgb, var(--teal) 32%, transparent); border-radius: 4px; background: transparent; color: var(--teal); cursor: pointer; }
-@keyframes context-in { from { opacity: 0; transform: translateY(5px); } }
 
 .library-head {
   display: flex;
@@ -629,7 +609,6 @@ dialog[open] { animation: dialog-in 180ms ease both; }
   .composer-row { min-height: 36px; padding: 1px 4px 4px 6px; }
   .ai-state { display: none; }
   .ai-state.processing { display: inline-flex; }
-  .context-bar { min-height: 34px; }
   .library-head { align-items: flex-start; padding: 12px 13px 9px; }
   .library-head h1 { font-size: var(--font-section); }
   .library-head p { display: none; }

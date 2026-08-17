@@ -100,7 +100,6 @@ const state = {
   sourceFilter: "",
   sort: "recent",
   newEntryIds: [],
-  activeThreadId: null,
   selectedThreadEntryId: null,
   threadAnchorId: null,
   selectedEntryId: null,
@@ -143,8 +142,6 @@ const elements = {
   focusLabel: document.querySelector("#focus-label"),
   focusProgress: document.querySelector("#focus-progress"),
   send: document.querySelector("#send-button"),
-  contextBar: document.querySelector("#context-bar"),
-  contextTitle: document.querySelector("#context-title"),
   search: document.querySelector("#search-input"),
   searchBox: document.querySelector(".search-box"),
   aiState: document.querySelector("#ai-state"),
@@ -800,7 +797,6 @@ function renderDetailPanel() {
 }
 
 function openEntryDetail(entry) {
-  if (state.activeThreadId && state.activeThreadId !== entry.id) state.activeThreadId = null;
   if (state.newEntryIds.includes(entry.id)) {
     state.newEntryIds = state.newEntryIds.filter((entryId) => entryId !== entry.id);
     renderNewEntryNotice();
@@ -982,13 +978,9 @@ function renderNavigation() {
 }
 
 function renderComposer() {
-  const entry = state.entries.find((item) => item.id === state.activeThreadId);
-  const stopping = state.activeRequests.size > 0;
-  if (!entry) state.activeThreadId = null;
-  elements.contextBar.hidden = !entry;
-  elements.contextTitle.textContent = entry ? `· ${entry.displayText || entry.raw}` : "";
-  elements.input.placeholder = entry ? "继续追问这个片段…" : "记录一个不懂的词、短语或句子…";
-  elements.source.disabled = Boolean(entry);
+  const stopping = pendingFragmentRequests().length > 0;
+  elements.input.placeholder = "记录一个不懂的词、短语或句子…";
+  elements.source.disabled = false;
   elements.composer.classList.toggle("processing", stopping);
   elements.send.disabled = !state.storageReady;
   elements.send.classList.toggle("stop", stopping);
@@ -999,7 +991,7 @@ function renderComposer() {
 }
 
 function renderCapturePage() {
-  const stopping = state.activeRequests.size > 0;
+  const stopping = pendingFragmentRequests().length > 0;
   elements.captureComposer.classList.toggle("processing", stopping);
   elements.captureSend.disabled = !state.storageReady;
   elements.captureSend.classList.toggle("stop", stopping);
@@ -1090,7 +1082,7 @@ function renderAiState() {
   });
   if (state.activeRequests.size) {
     const hasFollowup = [...state.activeRequests.values()].some((pending) => pending.entryId);
-    setTargets("processing", `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>正在处理 ${state.activeRequests.size > 1 ? `${state.activeRequests.size} 个请求` : hasFollowup || state.activeThreadId ? "追问" : "片段"}`, "正在等待模型返回，可点击停止按钮取消");
+    setTargets("processing", `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>正在处理 ${state.activeRequests.size > 1 ? `${state.activeRequests.size} 个请求` : hasFollowup ? "追问" : "片段"}`, "正在等待模型返回，可点击停止按钮取消");
     elements.aiState.hidden = false;
     elements.captureAiState.hidden = false;
     elements.quickModelSelect.hidden = true;
@@ -1276,7 +1268,6 @@ async function submitFragment(event, forceNew = false, overrideText = "") {
   const source = form.querySelector("select");
   const text = (overrideText || input.value).trim();
   if (!text || !state.storageReady) return;
-  const active = state.entries.find((entry) => entry.id === state.activeThreadId);
   const wasCapture = state.view === "capture";
   const pending = { id: crypto.randomUUID(), controller: new AbortController(), entryId: null };
 
@@ -1284,25 +1275,21 @@ async function submitFragment(event, forceNew = false, overrideText = "") {
   state.activeRequest = pending;
   render();
   try {
-    const result = await requestJson(active ? `/api/entries/${active.id}/followups` : "/api/entries", {
+    const result = await requestJson("/api/entries", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(active ? { text } : { text, source: source.value, ...(forceNew ? { forceNew: true } : {}) }),
+      body: JSON.stringify({ text, source: source.value, ...(forceNew ? { forceNew: true } : {}) }),
       signal: pending.controller.signal,
       requestId: pending.id,
     });
     if (pending.controller.signal.aborted) return;
-    if (active) {
-      state.entries[state.entries.findIndex((entry) => entry.id === active.id)] = result.entry;
-    } else {
-      const returnedEntries = Array.isArray(result.entries) && result.entries.length ? result.entries : [result.entry];
-      const additions = returnedEntries.filter((item) => !state.entries.some((entry) => entry.id === item.id));
-      state.entries.unshift(...additions);
-      if (additions.length) state.newEntryIds = [...new Set([...additions.map((entry) => entry.id), ...state.newEntryIds])];
-      if (wasCapture) {
-        state.view = "all";
-        state.sourceFilter = "";
-      }
+    const returnedEntries = Array.isArray(result.entries) && result.entries.length ? result.entries : [result.entry];
+    const additions = returnedEntries.filter((item) => !state.entries.some((entry) => entry.id === item.id));
+    state.entries.unshift(...additions);
+    if (additions.length) state.newEntryIds = [...new Set([...additions.map((entry) => entry.id), ...state.newEntryIds])];
+    if (wasCapture) {
+      state.view = "all";
+      state.sourceFilter = "";
     }
     input.value = "";
     input.style.height = "auto";
@@ -1396,20 +1383,15 @@ function stopThreadRequest(entryId) {
   }
 }
 
+function pendingFragmentRequests() {
+  return [...state.activeRequests.values()].filter((pending) => !pending.entryId);
+}
+
 function stopRequest() {
-  const pending = state.activeRequest;
+  const pending = pendingFragmentRequests().at(-1);
   if (!pending) return;
   pending.controller.abort();
   window.__TAURI__?.core?.invoke("cancel_request", { requestId: pending.id }).catch(() => {});
-}
-
-function newFragment() {
-  stopRequest();
-  state.activeThreadId = null;
-  state.view = "all";
-  elements.input.value = "";
-  render();
-  elements.input.focus();
 }
 
 async function rewindThread(entry, turnId) {
@@ -1440,7 +1422,6 @@ async function restoreEntries(entries) {
 
 async function handleAction(action, id, grade, turnId, hint) {
   const entry = state.entries.find((item) => item.id === id);
-  if (action === "new-fragment") return newFragment();
   if (action === "dismiss-new-entries") {
     state.newEntryIds = [];
     return renderNewEntryNotice();
@@ -1463,7 +1444,6 @@ async function handleAction(action, id, grade, turnId, hint) {
   }
   if (action === "focus-composer") {
     state.view = "capture";
-    state.activeThreadId = null;
     render();
     elements.captureInput.focus();
     return;
@@ -1579,11 +1559,13 @@ async function handleAction(action, id, grade, turnId, hint) {
     return render();
   }
   if (action === "continue" && entry) {
-    state.activeThreadId = entry.id;
-    state.selectedEntryId = entry.id;
+    state.view = "threads";
+    state.selectedThreadEntryId = entry.id;
+    state.threadAnchorId = entry.id;
+    state.selectedEntryId = null;
     state.detailClosed = false;
     state.detailOpened = true;
-    render(); elements.input.focus(); return;
+    render(); elements.threadInput.focus(); return;
   }
   if ((action === "toggle-thread" || action === "toggle-details") && entry) {
     return openEntryDetail(entry);
@@ -1599,7 +1581,8 @@ async function handleAction(action, id, grade, turnId, hint) {
     const snapshot = structuredClone(state.entries);
     await requestJson(`/api/entries/${entry.id}`, { method: "DELETE" });
     state.entries = state.entries.filter((item) => item.id !== entry.id);
-    if (state.activeThreadId === entry.id) state.activeThreadId = null;
+    if (state.selectedThreadEntryId === entry.id) state.selectedThreadEntryId = null;
+    if (state.threadAnchorId === entry.id) state.threadAnchorId = null;
     toast("片段已删除", { label: "撤销", run: () => restoreEntries(snapshot) });
   }
   if (action === "export") {
@@ -1612,7 +1595,7 @@ async function handleAction(action, id, grade, turnId, hint) {
     const result = await requestJson("/api/entries", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entries: seedEntries }),
     });
-    state.entries = result.entries; state.activeThreadId = null; state.selectedEntryId = state.entries[0]?.id || null; state.view = "all"; state.sourceFilter = ""; elements.dialog.close();
+    state.entries = result.entries; state.selectedThreadEntryId = null; state.threadAnchorId = null; state.selectedEntryId = state.entries[0]?.id || null; state.view = "all"; state.sourceFilter = ""; elements.dialog.close();
     toast("已恢复演示数据", { label: "撤销", run: () => restoreEntries(snapshot) });
   }
   render();
@@ -1727,13 +1710,13 @@ elements.sortSelect.addEventListener("change", () => {
 
 elements.composer.addEventListener("submit", submitFragment);
 elements.send.addEventListener("click", (event) => {
-  if (!state.activeRequest) return;
+  if (!pendingFragmentRequests().length) return;
   event.preventDefault();
   stopRequest();
 });
 elements.captureComposer.addEventListener("submit", submitFragment);
 elements.captureSend.addEventListener("click", (event) => {
-  if (!state.activeRequest) return;
+  if (!pendingFragmentRequests().length) return;
   event.preventDefault();
   stopRequest();
 });
