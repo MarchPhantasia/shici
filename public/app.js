@@ -595,6 +595,49 @@ function renderThreadIndex() {
   }).join("")}</div></div>`;
 }
 
+function renderEntrySupportingSections(entry, includeThread = true) {
+  const displayText = entry.displayText || entry.raw;
+  const original = entry.raw !== displayText
+    ? `<section class="detail-section"><span>原始输入</span><p class="detail-original">${escapeHtml(entry.raw)}</p></section>`
+    : "";
+  const words = entry.words?.length
+    ? `<section class="detail-section"><span>${entry.kind === "word_list" ? "逐词理解" : "读音"}</span>${renderWords(entry, "detail-words")}</section>`
+    : "";
+  const usage = entry.usage?.length
+    ? `<section class="detail-section"><span>语境 / 例句</span><div class="detail-quote">${entry.usage.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div></section>`
+    : "";
+  const chunks = entry.chunks?.length
+    ? `<section class="detail-section"><span>表达拆解</span><div class="detail-chunks">${entry.chunks.map((chunk) => `<div><strong>${escapeHtml(chunk.text)}</strong><p>${escapeHtml(chunk.meaning)}</p></div>`).join("")}</div></section>`
+    : "";
+  const ai = entry.context
+    ? `<section class="ai-explanation"><span>${icon("sparkles")}AI 理解</span><p>${escapeHtml(entry.context)}</p>${entry.conclusion && entry.conclusion !== entry.context ? `<p>${escapeHtml(entry.conclusion)}</p>` : ""}</section>`
+    : "";
+  const thread = includeThread && entry.thread?.length
+    ? `<section class="detail-section"><span>追问记录</span>${renderThread(entry)}</section>`
+    : "";
+  return `${original}${words}${usage}${chunks}${ai}${thread}`;
+}
+
+function renderThreadStudio(entry) {
+  const displayText = entry.displayText || entry.raw;
+  const review = reviewState(entry);
+  const turns = entry.thread || [];
+  const notes = turns.map((turn, index) => `<article class="thread-turn-note">
+    <div class="thread-note-head"><span>第 ${index + 1} 轮 · ${formatTime(turn.createdAt)}</span><span class="thread-note-actions"><button class="icon-button" type="button" data-action="copy-thread-turn" data-id="${escapeHtml(entry.id)}" data-turn-id="${escapeHtml(turn.id)}" aria-label="复制第 ${index + 1} 轮追问" title="复制">${icon("copy")}</button>${index < turns.length - 1 ? `<button class="icon-button" type="button" data-action="rewind-thread" data-id="${escapeHtml(entry.id)}" data-turn-id="${escapeHtml(turn.id)}" aria-label="回退到第 ${index + 1} 轮" title="回退到这一轮">${icon("undo-2")}</button>` : ""}</span></div>
+    <div class="thread-note-question"><span>问</span><p>${escapeHtml(turn.question)}</p></div>
+    <div class="thread-note-answer"><span>答</span><p>${escapeHtml(turn.answer)}</p></div>
+    ${turn.summary ? `<div class="thread-summary-bar"><strong>记忆结论</strong><p>${escapeHtml(turn.summary)}</p></div>` : ""}
+  </article>`).join("");
+  return `<article class="detail-sheet thread-studio">
+    <div class="detail-toolbar"><span>理解笔记</span><button class="icon-button" type="button" data-action="close-detail" aria-label="关闭详情">${icon("x")}</button></div>
+    <div class="detail-scroll">
+      <header class="detail-hero thread-studio-hero"><h2>${escapeHtml(displayText)}</h2><div class="detail-badges"><span>${kindLabels[entry.kind] || "片段"}</span>${entry.pronunciation ? `<span>${escapeHtml(entry.pronunciation)}</span>` : ""}${entry.source ? `<span>${escapeHtml(entry.source)}</span>` : ""}</div>${entry.correction ? `<p class="detail-correction">已纠正：${escapeHtml(entry.correction)}</p>` : ""}<p class="thread-studio-meaning">${escapeHtml(entry.meaning)}</p><div class="thread-studio-links"><button class="text-button" type="button" data-action="set-thread-anchor" data-id="${escapeHtml(entry.id)}">设为提问对象</button><button class="text-button" type="button" data-action="open-library-entry" data-id="${escapeHtml(entry.id)}">打开词库详情</button></div></header>
+      <main class="detail-body">${turns.length ? `<section class="thread-notes">${notes}</section>` : `<div class="thread-studio-empty">${icon("message-circle-more")}<p>这个词条已回到原片段，还没有追问记录。</p><button class="secondary-button" type="button" data-action="close-detail">关闭笔记</button></div>`}<details class="thread-entry-details"><summary>查看完整词条</summary><div>${renderEntrySupportingSections(entry, false)}</div></details></main>
+    </div>
+    <footer class="detail-actions"><span class="thread-studio-status">${review.leech ? "顽固词" : isDue(entry) ? "今天待复习" : `下次 ${dueLabel(entry)}`}</span>${isDue(entry) ? `<button class="secondary-button" type="button" data-action="start-review" data-id="${escapeHtml(entry.id)}">${icon("brain")}复习</button>` : ""}<button class="primary-button" type="button" data-action="continue" data-id="${escapeHtml(entry.id)}">${icon("message-circle-more")}再问一句</button></footer>
+  </article>`;
+}
+
 function renderThread(entry) {
   if (!entry.thread?.length) return "";
   return `<div class="thread-panel">
@@ -619,7 +662,8 @@ function renderSourcePicker(entry) {
 }
 
 function renderDetailPanel() {
-  const entry = state.entries.find((item) => item.id === state.selectedEntryId);
+  const threadView = state.view === "threads";
+  const entry = state.entries.find((item) => item.id === (threadView ? state.selectedThreadEntryId : state.selectedEntryId));
   const mobile = matchMedia("(max-width: 760px)").matches;
   const visible = Boolean(entry) && !state.detailClosed && state.view !== "review" && (!mobile || state.detailOpened);
   elements.detailPanel.hidden = !visible;
@@ -629,24 +673,14 @@ function renderDetailPanel() {
     elements.detailContent.innerHTML = "";
     return;
   }
+  if (threadView) {
+    elements.detailContent.innerHTML = renderThreadStudio(entry);
+    refreshIcons();
+    return;
+  }
 
   const displayText = entry.displayText || entry.raw;
   const review = reviewState(entry);
-  const original = entry.raw !== displayText
-    ? `<section class="detail-section"><span>原始输入</span><p class="detail-original">${escapeHtml(entry.raw)}</p></section>`
-    : "";
-  const words = entry.words?.length
-    ? `<section class="detail-section"><span>${entry.kind === "word_list" ? "逐词理解" : "读音"}</span>${renderWords(entry, "detail-words")}</section>`
-    : "";
-  const usage = entry.usage?.length
-    ? `<section class="detail-section"><span>语境 / 例句</span><div class="detail-quote">${entry.usage.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div></section>`
-    : "";
-  const chunks = entry.chunks?.length
-    ? `<section class="detail-section"><span>表达拆解</span><div class="detail-chunks">${entry.chunks.map((chunk) => `<div><strong>${escapeHtml(chunk.text)}</strong><p>${escapeHtml(chunk.meaning)}</p></div>`).join("")}</div></section>`
-    : "";
-  const thread = entry.thread?.length
-    ? `<section class="detail-section"><span>追问记录</span>${renderThread(entry)}</section>`
-    : "";
 
   elements.detailContent.innerHTML = `
     <article class="detail-sheet">
@@ -669,9 +703,7 @@ function renderDetailPanel() {
             <span>释义</span>
             <h3>${escapeHtml(entry.meaning)}</h3>
           </section>
-          ${original}${words}${usage}${chunks}
-          ${entry.context ? `<section class="ai-explanation"><span>${icon("sparkles")}AI 理解</span><p>${escapeHtml(entry.context)}</p>${entry.conclusion && entry.conclusion !== entry.context ? `<p>${escapeHtml(entry.conclusion)}</p>` : ""}</section>` : ""}
-          ${thread}
+          ${renderEntrySupportingSections(entry)}
           <section class="detail-meta">
             <span>学习记录</span>
             <dl>
@@ -809,8 +841,6 @@ function renderTimeline() {
   }
   if (state.view === "threads") {
     state.selectedEntryId = null;
-    state.detailClosed = true;
-    state.detailOpened = false;
     elements.timeline.innerHTML = renderThreadIndex();
     renderDetailPanel();
     refreshIcons();
@@ -1301,7 +1331,35 @@ async function handleAction(action, id, grade, turnId, hint) {
   if (action === "open-detail" && entry) return openEntryDetail(entry);
   if (action === "open-thread" && entry) {
     state.selectedThreadEntryId = entry.id;
+    state.detailClosed = false;
+    state.detailOpened = true;
     renderTimeline();
+    return;
+  }
+  if (action === "set-thread-anchor" && entry) {
+    state.threadAnchorId = entry.id;
+    toast(`已选择“${entry.displayText || entry.raw}”作为提问对象`);
+    return;
+  }
+  if (action === "open-library-entry" && entry) {
+    state.view = "all";
+    state.sourceFilter = "";
+    state.selectedEntryId = entry.id;
+    state.detailClosed = false;
+    state.detailOpened = true;
+    return render();
+  }
+  if (action === "copy-thread-turn" && entry) {
+    const turn = entry.thread?.find((item) => item.id === turnId);
+    if (!turn) return;
+    const text = `问：${turn.question}\n答：${turn.answer}${turn.summary ? `\n记忆结论：${turn.summary}` : ""}`;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const textarea = Object.assign(document.createElement("textarea"), { value: text });
+      document.body.append(textarea); textarea.select(); document.execCommand("copy"); textarea.remove();
+    }
+    toast("已复制这轮追问");
     return;
   }
   if (action === "close-detail") {
