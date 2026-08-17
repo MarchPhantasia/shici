@@ -1,5 +1,5 @@
-const CACHE = "shici-v31";
-const FILES = ["/", "/styles.css?v=28", "/app.js?v=31", "/vendor/lucide.min.js?v=19", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "shici-v32";
+const FILES = ["/", "/styles.css?v=29", "/app.js?v=31", "/vendor/lucide.min.js?v=19", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();

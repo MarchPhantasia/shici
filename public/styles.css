@@ -1069,6 +1069,10 @@ body.review-mode .review-shell { width: min(100%, 820px); margin-inline: auto; }
   body.review-mode .review-shell { width: min(100%, 640px); }
   body.review-mode .review-card { width: 100%; }
   .detail-panel:not([hidden]) { border-radius: 18px; }
+  body.review-mode .workspace-body, body.capture-mode .workspace-body { width: 100%; max-width: 100%; min-width: 0; overflow-x: hidden; }
+  body.review-mode .timeline, body.review-mode .review-shell, body.review-mode .review-card { width: 100%; max-width: 100%; min-width: 0; }
+  .review-prompt, .review-answer { min-width: 0; max-width: 100%; }
+  .review-prompt h2 { max-width: 100%; overflow-wrap: anywhere; }
   .thread-composer { position: sticky; top: 0; z-index: 10; margin: -14px 0 14px; padding: 8px 0; background: color-mix(in srgb, var(--canvas) 94%, transparent); backdrop-filter: blur(8px); }
   .thread-composer-main { min-height: 62px; padding: 9px 10px 3px; }
   .thread-anchor-pill { max-width: 48vw; }
