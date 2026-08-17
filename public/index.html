@@ -37,6 +37,22 @@
 
         <div class="workspace-body">
           <section class="library-column">
+            <section class="thread-composer" id="thread-composer" hidden aria-label="追问输入">
+              <form id="thread-form">
+                <div class="thread-composer-main">
+                  <div class="thread-anchor" id="thread-anchor"></div>
+                  <textarea id="thread-input" rows="2" maxlength="5000" placeholder="选择一个词条，继续追问…"></textarea>
+                </div>
+                <div class="thread-composer-row">
+                  <span class="thread-composer-message" id="thread-composer-message" role="status" aria-live="polite"></span>
+                  <div class="thread-composer-actions"><span class="ai-state" id="thread-ai-state"><span class="status-dot"></span>就绪</span><button class="send-button" id="thread-send" type="submit" aria-label="发送追问"></button></div>
+                </div>
+              </form>
+              <div class="mention-popover" id="mention-popover" hidden>
+                <input id="mention-search" type="search" placeholder="搜索词条、释义或来源…" autocomplete="off" aria-label="搜索要追问的词条" />
+                <div id="mention-list" role="listbox" aria-label="词条选择"></div>
+              </div>
+            </section>
             <div class="capture-grid">
               <section class="composer-shell" aria-label="输入语言片段">
                 <div class="context-bar" id="context-bar" hidden>

@@ -151,6 +151,16 @@ const elements = {
   quickModelSelect: document.querySelector("#quick-model-select"),
   captureQuickModelSelect: document.querySelector("#capture-quick-model-select"),
   captureAiState: document.querySelector("#capture-ai-state"),
+  threadComposer: document.querySelector("#thread-composer"),
+  threadForm: document.querySelector("#thread-form"),
+  threadAnchor: document.querySelector("#thread-anchor"),
+  threadInput: document.querySelector("#thread-input"),
+  threadSend: document.querySelector("#thread-send"),
+  threadAiState: document.querySelector("#thread-ai-state"),
+  threadMessage: document.querySelector("#thread-composer-message"),
+  mentionPopover: document.querySelector("#mention-popover"),
+  mentionSearch: document.querySelector("#mention-search"),
+  mentionList: document.querySelector("#mention-list"),
   detailPanel: document.querySelector("#detail-panel"),
   detailBackdrop: document.querySelector(".detail-backdrop"),
   detailContent: document.querySelector("#detail-content"),
@@ -539,18 +549,21 @@ function dueLabel(entry) {
   return `约 ${formatInterval(days)}后`;
 }
 
+function entrySearchHaystack(entry) {
+  let haystack = searchCache.get(entry);
+  if (haystack !== undefined) return haystack;
+  haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.thread || []).flatMap((turn) => [turn.question, turn.answer, turn.summary]), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning, ...(word.partOfSpeech || []), ...(word.forms || []).flatMap((form) => [form.form, form.label])])].join(" ").toLowerCase();
+  searchCache.set(entry, haystack);
+  return haystack;
+}
+
 function filteredEntries() {
   const query = state.query.trim().toLowerCase();
   const entries = state.entries.filter((entry) => {
     if (state.view === "starred" && !entry.starred) return false;
     if (state.sourceFilter && entry.source !== state.sourceFilter) return false;
     if (!query) return true;
-    let haystack = searchCache.get(entry);
-    if (!haystack) {
-      haystack = [entry.raw, entry.displayText, entry.meaning, entry.context, entry.source, ...(entry.usage || []), ...(entry.thread || []).flatMap((turn) => [turn.question, turn.answer, turn.summary]), ...(entry.words || []).flatMap((word) => [word.text, word.pronunciation, word.meaning, ...(word.partOfSpeech || []), ...(word.forms || []).flatMap((form) => [form.form, form.label])])].join(" ").toLowerCase();
-      searchCache.set(entry, haystack);
-    }
-    return haystack.includes(query);
+    return entrySearchHaystack(entry).includes(query);
   });
   const text = (entry) => entry.displayText || entry.raw || "";
   const recent = (left, right) => Number(right.createdAt) - Number(left.createdAt);
@@ -578,6 +591,61 @@ function reconcileThreadState() {
   if (state.threadAnchorId && !ids.has(state.threadAnchorId)) state.threadAnchorId = null;
 }
 
+function pendingForEntry(entryId) {
+  return [...state.activeRequests.values()].filter((pending) => pending.entryId === entryId);
+}
+
+function renderMentionOptions() {
+  const query = elements.mentionSearch.value.trim().toLowerCase();
+  const entries = state.entries
+    .filter((entry) => !query || entrySearchHaystack(entry).includes(query))
+    .sort((left, right) => {
+      const leftThread = Number(left.thread?.at(-1)?.createdAt || 0);
+      const rightThread = Number(right.thread?.at(-1)?.createdAt || 0);
+      return rightThread - leftThread || Number(right.createdAt) - Number(left.createdAt);
+    });
+  const visible = entries.slice(0, 20);
+  elements.mentionList.innerHTML = visible.length
+    ? visible.map((entry, index) => `<button class="mention-option" type="button" role="option" aria-selected="${index === 0}" data-action="select-thread-anchor" data-id="${escapeHtml(entry.id)}"><span><strong>${escapeHtml(entry.displayText || entry.raw)}</strong><small>${escapeHtml(entry.meaning || kindLabels[entry.kind] || "语言片段")}</small></span>${entry.thread?.length ? `<b>${entry.thread.length} 轮</b>` : ""}</button>`).join("")
+    : `<div class="mention-empty">没有匹配的词条</div>`;
+  if (entries.length > visible.length) elements.mentionList.insertAdjacentHTML("beforeend", `<div class="mention-limit">继续输入以缩小范围</div>`);
+}
+
+function openMentionPopover() {
+  elements.mentionPopover.hidden = false;
+  elements.mentionSearch.value = "";
+  renderMentionOptions();
+  elements.mentionSearch.focus();
+}
+
+function closeMentionPopover() {
+  elements.mentionPopover.hidden = true;
+  elements.mentionSearch.value = "";
+}
+
+function renderThreadComposer() {
+  const visible = state.view === "threads";
+  elements.threadComposer.hidden = !visible;
+  if (!visible) {
+    closeMentionPopover();
+    return;
+  }
+  const entry = state.entries.find((item) => item.id === state.threadAnchorId);
+  const pending = entry ? pendingForEntry(entry.id) : [];
+  elements.threadAnchor.innerHTML = entry
+    ? `<button class="thread-anchor-pill" type="button" data-action="open-mentions" aria-label="更换提问词条"><span>${icon("at-sign")}</span><strong>${escapeHtml(entry.displayText || entry.raw)}</strong>${icon("chevron-down")}</button><button class="thread-anchor-remove" type="button" data-action="clear-thread-anchor" aria-label="移除提问词条">${icon("x")}</button>`
+    : `<button class="thread-anchor-empty" type="button" data-action="open-mentions">${icon("at-sign")}选择词条</button>`;
+  elements.threadSend.classList.toggle("stop", pending.length > 0);
+  elements.threadSend.disabled = !state.storageReady;
+  elements.threadSend.innerHTML = pending.length ? icon("square") : icon("arrow-up");
+  elements.threadSend.setAttribute("aria-label", pending.length ? "停止当前词条追问" : "发送追问");
+  elements.threadSend.title = pending.length ? "停止当前词条追问" : `发送：${shortcutLabels[appearance.sendShortcut]}`;
+  elements.threadAiState.className = `ai-state${pending.length ? " processing" : ""}`;
+  elements.threadAiState.innerHTML = pending.length
+    ? `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>${pending.length > 1 ? `${pending.length} 个请求` : "正在追问"}`
+    : `<span class="status-dot"></span>${entry ? "已选择词条" : "先选择词条"}`;
+}
+
 function renderThreadIndex() {
   const entries = threadedEntries();
   if (!entries.length) {
@@ -591,7 +659,8 @@ function renderThreadIndex() {
     const title = entry.displayText || entry.raw;
     const summary = last.summary || last.question || "等待归纳";
     const selected = state.selectedThreadEntryId === entry.id;
-    return `<button class="thread-index-row ${selected ? "selected" : ""}" type="button" data-action="open-thread" data-id="${escapeHtml(entry.id)}" aria-pressed="${selected}"><span class="thread-index-main"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(summary)}</span></span><span class="thread-index-meta"><b>${entry.thread.length} 轮</b><time>${formatTime(last.createdAt)}</time></span></button>`;
+    const pending = pendingForEntry(entry.id);
+    return `<div class="thread-index-row ${selected ? "selected" : ""}" role="button" tabindex="0" data-action="open-thread" data-id="${escapeHtml(entry.id)}" aria-pressed="${selected}"><span class="thread-index-main"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(summary)}</span></span><span class="thread-index-meta"><b>${entry.thread.length} 轮</b>${pending.length ? `<span class="thread-pending"><span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span><button type="button" data-action="stop-thread-request" data-id="${escapeHtml(entry.id)}" aria-label="停止 ${escapeHtml(title)} 的追问">停止</button></span>` : `<time>${formatTime(last.createdAt)}</time>`}</span></div>`;
   }).join("")}</div></div>`;
 }
 
@@ -622,6 +691,7 @@ function renderThreadStudio(entry) {
   const displayText = entry.displayText || entry.raw;
   const review = reviewState(entry);
   const turns = entry.thread || [];
+  const pending = pendingForEntry(entry.id);
   const notes = turns.map((turn, index) => `<article class="thread-turn-note">
     <div class="thread-note-head"><span>第 ${index + 1} 轮 · ${formatTime(turn.createdAt)}</span><span class="thread-note-actions"><button class="icon-button" type="button" data-action="copy-thread-turn" data-id="${escapeHtml(entry.id)}" data-turn-id="${escapeHtml(turn.id)}" aria-label="复制第 ${index + 1} 轮追问" title="复制">${icon("copy")}</button>${index < turns.length - 1 ? `<button class="icon-button" type="button" data-action="rewind-thread" data-id="${escapeHtml(entry.id)}" data-turn-id="${escapeHtml(turn.id)}" aria-label="回退到第 ${index + 1} 轮" title="回退到这一轮">${icon("undo-2")}</button>` : ""}</span></div>
     <div class="thread-note-question"><span>问</span><p>${escapeHtml(turn.question)}</p></div>
@@ -629,7 +699,7 @@ function renderThreadStudio(entry) {
     ${turn.summary ? `<div class="thread-summary-bar"><strong>记忆结论</strong><p>${escapeHtml(turn.summary)}</p></div>` : ""}
   </article>`).join("");
   return `<article class="detail-sheet thread-studio">
-    <div class="detail-toolbar"><span>理解笔记</span><button class="icon-button" type="button" data-action="close-detail" aria-label="关闭详情">${icon("x")}</button></div>
+    <div class="detail-toolbar"><span>理解笔记</span><div class="thread-studio-pending">${pending.length ? `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>${pending.length > 1 ? `${pending.length} 个请求` : "追问中"}<button class="text-button" type="button" data-action="stop-thread-request" data-id="${escapeHtml(entry.id)}">停止</button>` : ""}<button class="icon-button" type="button" data-action="close-detail" aria-label="关闭详情">${icon("x")}</button></div></div>
     <div class="detail-scroll">
       <header class="detail-hero thread-studio-hero"><h2>${escapeHtml(displayText)}</h2><div class="detail-badges"><span>${kindLabels[entry.kind] || "片段"}</span>${entry.pronunciation ? `<span>${escapeHtml(entry.pronunciation)}</span>` : ""}${entry.source ? `<span>${escapeHtml(entry.source)}</span>` : ""}</div>${entry.correction ? `<p class="detail-correction">已纠正：${escapeHtml(entry.correction)}</p>` : ""}<p class="thread-studio-meaning">${escapeHtml(entry.meaning)}</p><div class="thread-studio-links"><button class="text-button" type="button" data-action="set-thread-anchor" data-id="${escapeHtml(entry.id)}">设为提问对象</button><button class="text-button" type="button" data-action="open-library-entry" data-id="${escapeHtml(entry.id)}">打开词库详情</button></div></header>
       <main class="detail-body">${turns.length ? `<section class="thread-notes">${notes}</section>` : `<div class="thread-studio-empty">${icon("message-circle-more")}<p>这个词条已回到原片段，还没有追问记录。</p><button class="secondary-button" type="button" data-action="close-detail">关闭笔记</button></div>`}<details class="thread-entry-details"><summary>查看完整词条</summary><div>${renderEntrySupportingSections(entry, false)}</div></details></main>
@@ -945,6 +1015,7 @@ function render() {
   renderNewEntryNotice();
   renderComposer();
   renderCapturePage();
+  renderThreadComposer();
   refreshIcons();
 }
 
@@ -1018,7 +1089,8 @@ function renderAiState() {
     target.title = title;
   });
   if (state.activeRequests.size) {
-    setTargets("processing", `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>正在处理 ${state.activeRequests.size > 1 ? `${state.activeRequests.size} 个请求` : state.activeThreadId ? "追问" : "片段"}`, "正在等待模型返回，可点击停止按钮取消");
+    const hasFollowup = [...state.activeRequests.values()].some((pending) => pending.entryId);
+    setTargets("processing", `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>正在处理 ${state.activeRequests.size > 1 ? `${state.activeRequests.size} 个请求` : hasFollowup || state.activeThreadId ? "追问" : "片段"}`, "正在等待模型返回，可点击停止按钮取消");
     elements.aiState.hidden = false;
     elements.captureAiState.hidden = false;
     elements.quickModelSelect.hidden = true;
@@ -1206,7 +1278,7 @@ async function submitFragment(event, forceNew = false, overrideText = "") {
   if (!text || !state.storageReady) return;
   const active = state.entries.find((entry) => entry.id === state.activeThreadId);
   const wasCapture = state.view === "capture";
-  const pending = { id: crypto.randomUUID(), controller: new AbortController() };
+  const pending = { id: crypto.randomUUID(), controller: new AbortController(), entryId: null };
 
   state.activeRequests.set(pending.id, pending);
   state.activeRequest = pending;
@@ -1246,6 +1318,81 @@ async function submitFragment(event, forceNew = false, overrideText = "") {
     state.activeRequests.delete(pending.id);
     if (state.activeRequest?.id === pending.id) state.activeRequest = [...state.activeRequests.values()].at(-1) || null;
     render();
+  }
+}
+
+function restoreThreadDraft(pending, message) {
+  const restore = () => {
+    state.threadAnchorId = pending.entryId;
+    elements.threadInput.value = pending.text;
+    elements.threadInput.focus();
+    renderThreadComposer();
+  };
+  if (!elements.threadInput.value.trim()) {
+    restore();
+    toast(message);
+    return;
+  }
+  toast(message, { label: "恢复草稿", run: async () => restore() });
+}
+
+async function submitThreadQuestion(event) {
+  event.preventDefault();
+  const entry = state.entries.find((item) => item.id === state.threadAnchorId);
+  const text = elements.threadInput.value.trim();
+  if (!entry) {
+    elements.threadMessage.textContent = "先用 @ 选择一个词条";
+    elements.threadComposer.classList.remove("shake");
+    requestAnimationFrame(() => elements.threadComposer.classList.add("shake"));
+    return;
+  }
+  if (!text || !state.storageReady) {
+    elements.threadMessage.textContent = text ? "本地存储尚未就绪" : "先写下你想弄明白的问题";
+    return;
+  }
+  elements.threadMessage.textContent = "";
+  const pending = { id: crypto.randomUUID(), controller: new AbortController(), entryId: entry.id, text };
+  state.activeRequests.set(pending.id, pending);
+  state.activeRequest = pending;
+  elements.threadInput.value = "";
+  render();
+  try {
+    const result = await requestJson(`/api/entries/${entry.id}/followups`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+      signal: pending.controller.signal,
+      requestId: pending.id,
+    });
+    if (pending.controller.signal.aborted) return;
+    const index = state.entries.findIndex((item) => item.id === entry.id);
+    if (index >= 0) state.entries[index] = result.entry;
+    if (state.selectedThreadEntryId === entry.id) {
+      state.detailClosed = false;
+      state.detailOpened = true;
+    } else {
+      toast("已加入 1 条理解", { label: "查看", run: async () => {
+        state.view = "threads";
+        state.selectedThreadEntryId = entry.id;
+        state.detailClosed = false;
+        state.detailOpened = true;
+        render();
+      } });
+    }
+  } catch (error) {
+    const stopped = pending.controller.signal.aborted || error.name === "AbortError" || error.message === "请求已暂停";
+    restoreThreadDraft(pending, stopped ? "已停止，内容未保存" : (error.message || "追问失败"));
+  } finally {
+    state.activeRequests.delete(pending.id);
+    if (state.activeRequest?.id === pending.id) state.activeRequest = [...state.activeRequests.values()].at(-1) || null;
+    render();
+  }
+}
+
+function stopThreadRequest(entryId) {
+  for (const pending of pendingForEntry(entryId)) {
+    pending.controller.abort();
+    window.__TAURI__?.core?.invoke("cancel_request", { requestId: pending.id }).catch(() => {});
   }
 }
 
@@ -1319,6 +1466,28 @@ async function handleAction(action, id, grade, turnId, hint) {
     state.activeThreadId = null;
     render();
     elements.captureInput.focus();
+    return;
+  }
+  if (action === "open-mentions") {
+    openMentionPopover();
+    return;
+  }
+  if (action === "clear-thread-anchor") {
+    state.threadAnchorId = null;
+    closeMentionPopover();
+    renderThreadComposer();
+    elements.threadInput.focus();
+    return;
+  }
+  if (action === "select-thread-anchor" && entry) {
+    state.threadAnchorId = entry.id;
+    closeMentionPopover();
+    renderThreadComposer();
+    elements.threadInput.focus();
+    return;
+  }
+  if (action === "stop-thread-request" && entry) {
+    stopThreadRequest(entry.id);
     return;
   }
   if (action === "focus-search") {
@@ -1499,6 +1668,7 @@ async function importLibraryFile(event) {
 }
 
 document.addEventListener("click", (event) => {
+  if (!event.target.closest("#mention-popover, #thread-anchor")) closeMentionPopover();
   const actionTarget = event.target.closest("[data-action]");
   if (actionTarget) {
     handleAction(actionTarget.dataset.action, actionTarget.dataset.id, actionTarget.dataset.grade, actionTarget.dataset.turnId, actionTarget.dataset.hint).catch((error) => toast(error.message || "操作失败"));
@@ -1566,6 +1736,44 @@ elements.captureSend.addEventListener("click", (event) => {
   if (!state.activeRequest) return;
   event.preventDefault();
   stopRequest();
+});
+elements.threadForm.addEventListener("submit", submitThreadQuestion);
+elements.threadSend.addEventListener("click", (event) => {
+  const entry = state.entries.find((item) => item.id === state.threadAnchorId);
+  if (!entry || !pendingForEntry(entry.id).length) return;
+  event.preventDefault();
+  stopThreadRequest(entry.id);
+});
+elements.threadInput.addEventListener("keydown", (event) => {
+  if (event.key === "@" && !elements.threadInput.value.trim()) {
+    event.preventDefault();
+    openMentionPopover();
+    return;
+  }
+  if (event.key !== "Enter" || event.isComposing) return;
+  const sends = appearance.sendShortcut === "mod-enter"
+    ? (event.metaKey || event.ctrlKey) && !event.shiftKey
+    : appearance.sendShortcut === "shift-enter"
+      ? event.shiftKey && !event.metaKey && !event.ctrlKey
+      : !event.shiftKey && !event.metaKey && !event.ctrlKey;
+  if (sends) { event.preventDefault(); elements.threadForm.requestSubmit(); }
+});
+elements.threadInput.addEventListener("input", () => {
+  elements.threadInput.style.height = "auto";
+  elements.threadInput.style.height = `${Math.min(elements.threadInput.scrollHeight, 150)}px`;
+  elements.threadMessage.textContent = "";
+});
+elements.mentionSearch.addEventListener("input", renderMentionOptions);
+elements.mentionSearch.addEventListener("keydown", (event) => {
+  const options = [...elements.mentionList.querySelectorAll(".mention-option")];
+  if (event.key === "Escape") { event.preventDefault(); closeMentionPopover(); elements.threadInput.focus(); return; }
+  if (!options.length || !["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) return;
+  event.preventDefault();
+  let index = options.findIndex((option) => option.getAttribute("aria-selected") === "true");
+  if (event.key === "ArrowDown") index = (index + 1) % options.length;
+  if (event.key === "ArrowUp") index = (index - 1 + options.length) % options.length;
+  if (event.key === "Enter") return options[Math.max(0, index)]?.click();
+  options.forEach((option, optionIndex) => option.setAttribute("aria-selected", String(optionIndex === index)));
 });
 elements.configForm.addEventListener("submit", saveAiConfig);
 elements.webdavForm.addEventListener("submit", saveWebdavConfig);

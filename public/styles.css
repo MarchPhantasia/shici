@@ -831,6 +831,46 @@ dialog[open] { animation: dialog-in 180ms ease both; }
 .thread-studio-empty > svg { width: 25px; height: 25px; color: var(--border-strong); }
 .thread-studio-empty p { margin: 0; font-size: var(--font-body); }
 .thread-studio-status { min-width: 0; margin-right: auto; overflow: hidden; color: var(--faint); font-size: var(--font-caption); text-overflow: ellipsis; white-space: nowrap; }
+.thread-composer { position: relative; z-index: 4; margin-bottom: 16px; }
+.thread-composer form { overflow: visible; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: 0 5px 20px color-mix(in srgb, var(--teal) 8%, transparent); }
+.thread-composer-main { display: flex; align-items: flex-start; gap: 8px; min-height: 74px; padding: 12px 14px 4px; }
+.thread-anchor { display: flex; align-items: center; flex: 0 1 auto; min-width: 0; gap: 2px; padding-top: 2px; }
+.thread-anchor-empty, .thread-anchor-pill, .thread-anchor-remove { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; border: 0; background: transparent; color: var(--pink); cursor: pointer; }
+.thread-anchor-empty { padding: 0 4px; white-space: nowrap; font-size: var(--font-support); font-weight: 650; }
+.thread-anchor-pill { max-width: min(34vw, 270px); padding: 0 7px; border-radius: 999px; background: var(--pink-soft); }
+.thread-anchor-pill strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-support); font-weight: 650; }
+.thread-anchor-pill svg, .thread-anchor-empty svg { width: 15px; height: 15px; flex: 0 0 auto; }
+.thread-anchor-remove { width: 26px; justify-content: center; padding: 0; border-radius: 50%; color: var(--muted); }
+.thread-anchor-remove:hover, .thread-anchor-pill:hover, .thread-anchor-empty:hover { color: var(--pink-hover); background: var(--pink-soft); }
+.thread-anchor-remove svg { width: 13px; height: 13px; }
+.thread-composer textarea { flex: 1 1 auto; min-width: 0; min-height: 48px; max-height: 150px; padding: 3px 0; border: 0; outline: 0; resize: none; background: transparent; color: var(--text); line-height: 1.6; }
+.thread-composer textarea::placeholder { color: var(--faint); }
+.thread-composer-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 43px; padding: 5px 10px 8px 14px; }
+.thread-composer-message { min-width: 0; overflow: hidden; color: var(--rose); font-size: var(--font-caption); text-overflow: ellipsis; white-space: nowrap; }
+.thread-composer-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.thread-composer-actions .ai-state { max-width: 150px; }
+.thread-composer-actions .send-button { width: 32px; min-width: 32px; height: 32px; padding: 0; }
+.thread-composer-actions .send-button svg { margin: 0; }
+.mention-popover { position: absolute; z-index: 8; top: calc(100% - 5px); left: 0; width: min(100%, 430px); max-height: min(360px, 60vh); overflow: auto; padding: 8px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); box-shadow: 0 16px 40px color-mix(in srgb, var(--text) 15%, transparent); }
+.mention-popover > input { width: 100%; height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 9px; outline: 0; background: var(--surface-soft); color: var(--text); font-size: var(--font-support); }
+.mention-popover > input:focus { border-color: var(--teal); }
+.mention-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 48px; padding: 7px 9px; border: 0; border-radius: 9px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.mention-option[aria-selected="true"], .mention-option:hover { background: var(--surface-soft); }
+.mention-option > span { display: grid; min-width: 0; gap: 3px; }
+.mention-option strong, .mention-option small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-option strong { font-size: var(--font-support); }
+.mention-option small { color: var(--muted); font-size: var(--font-caption); }
+.mention-option b { flex: 0 0 auto; color: var(--teal); font-size: var(--font-caption); }
+.mention-empty, .mention-limit { padding: 12px 9px; color: var(--faint); font-size: var(--font-caption); text-align: center; }
+.mention-limit { border-top: 1px solid var(--border); }
+.thread-pending { display: inline-flex; align-items: center; gap: 4px; color: var(--pink); }
+.thread-pending .thinking-dots { min-width: 18px; }
+.thread-pending button, .thread-studio-pending .text-button { min-height: 23px; padding: 0 5px; border: 0; border-radius: 5px; background: transparent; color: var(--pink); font-size: var(--font-caption); cursor: pointer; }
+.thread-pending button:hover, .thread-studio-pending .text-button:hover { background: var(--pink-soft); }
+.thread-studio-pending { display: inline-flex; align-items: center; gap: 6px; color: var(--pink); font-size: var(--font-caption); }
+.thread-studio-pending .icon-button { width: 26px; height: 26px; border: 0; background: transparent; }
+.thread-composer.shake { animation: thread-shake 240ms ease; }
+@keyframes thread-shake { 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
 
 .detail-panel { min-width: 0; min-height: 0; height: calc(100% - 12px); margin-top: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 3px; background: var(--surface); box-shadow: 0 3px 18px rgba(31, 104, 96, .045); }
 .detail-panel[hidden] { display: block !important; visibility: hidden; border-color: transparent; background: transparent; box-shadow: none; }
