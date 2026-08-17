@@ -422,7 +422,7 @@ body.review-mode .timeline { grid-row: 2; }
 .review-prompt h2 { max-width: 680px; margin: 12px 0 0; overflow-wrap: anywhere; font-size: var(--font-review); line-height: 1.25; font-weight: 650; }
 .review-prompt p { margin: 8px 0 0; color: var(--faint); }
 .review-answer { max-height: 0; padding: 0 34px; overflow: hidden; border-top: 1px solid transparent; opacity: 0; transform: translateY(8px); transition: max-height 360ms ease, padding 300ms ease, opacity 220ms ease, transform 300ms ease, border-color 200ms ease; }
-.review-card.revealed .review-answer { max-height: 520px; padding: 25px 34px 28px; border-color: var(--border); opacity: 1; transform: translateY(0); }
+.review-card.revealed .review-answer { max-height: none; padding: 25px 34px 28px; overflow: visible; border-color: var(--border); opacity: 1; transform: translateY(0); }
 .review-answer h3 { margin: 8px 0 0; font-size: var(--font-section); line-height: 1.53; }
 .review-answer p { margin: 9px 0 0; color: var(--muted); font-size: var(--font-body); line-height: 1.65; }
 .review-chunks { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
@@ -441,6 +441,24 @@ body.review-mode .timeline { grid-row: 2; }
 .review-hint-chunks { display: flex; flex-wrap: wrap; gap: 6px; }
 .review-hint-chunks span { display: inline-flex; gap: 5px; padding: 4px 7px; border-radius: 8px; background: color-mix(in srgb, var(--surface) 76%, transparent); font-size: var(--font-caption); }
 .review-hint-chunks strong { color: var(--text); }
+.review-thread-recall { margin-top: 18px; padding: 13px 14px; border-radius: 12px; background: var(--surface-soft); }
+.review-thread-recall-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.review-thread-recall-head > span { display: inline-flex; align-items: center; gap: 6px; color: var(--teal); font-size: var(--font-support); font-weight: 700; }
+.review-thread-recall-head svg { width: 15px; height: 15px; }
+.review-thread-recall-head small { color: var(--faint); font-size: var(--font-caption); }
+.review-thread-recent { display: grid; gap: 8px; margin-top: 10px; }
+.review-thread-turn { padding: 9px 10px; border-radius: 9px; background: var(--surface); }
+.review-thread-turn.compact { background: color-mix(in srgb, var(--surface) 72%, var(--teal-soft)); }
+.review-thread-turn strong { display: block; color: var(--text); font-size: var(--font-support); line-height: 1.45; }
+.review-thread-turn p { margin: 4px 0 0; color: var(--faint); font-size: var(--font-caption); line-height: 1.5; }
+.review-thread-turn > div { display: grid; grid-template-columns: auto 1fr; gap: 7px; margin-top: 8px; color: var(--muted); font-size: var(--font-support); line-height: 1.55; }
+.review-thread-turn > div span { color: var(--teal); font-weight: 650; }
+.review-thread-all { margin-top: 10px; border-top: 1px solid var(--border); }
+.review-thread-all summary { padding-top: 10px; color: var(--teal); font-size: var(--font-caption); font-weight: 650; cursor: pointer; }
+.review-thread-all > div { display: grid; gap: 7px; padding-top: 8px; }
+.review-followup-action { display: flex; justify-content: center; padding: 14px 28px 4px; }
+.review-followup-action .secondary-button { min-height: 34px; padding-inline: 14px; border-radius: 999px; }
+.review-followup-action .secondary-button svg { width: 15px; height: 15px; }
 @keyframes hint-in { from { opacity: 0; transform: translateY(4px); } }
 .reveal-button { display: flex; align-items: center; justify-content: center; gap: 7px; width: calc(100% - 56px); min-height: 44px; margin: 0 28px 28px; border: 0; border-radius: 6px; background: var(--teal); color: #fff; font-weight: 650; cursor: pointer; }
 .reveal-button:hover { background: var(--teal-hover); }

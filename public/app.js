@@ -853,6 +853,15 @@ function renderReviewHint(entry) {
   return `<aside class="review-hint-panel strong"><span>${icon("sparkles")}AI 理解</span>${details.length ? details.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : `<p>${escapeHtml(entry.meaning || "暂无更多理解提示。")}</p>`}</aside>`;
 }
 
+function renderReviewThreadRecall(entry) {
+  const turns = (entry.thread || []).filter((turn) => turn?.summary);
+  if (!turns.length) return "";
+  const renderTurn = (turn, compact = false) => `<article class="review-thread-turn${compact ? " compact" : ""}"><strong>${escapeHtml(turn.summary)}</strong><p>${escapeHtml(turn.question)}</p>${compact ? "" : `<div><span>答</span>${escapeHtml(turn.answer)}</div>`}</article>`;
+  const recent = turns.slice(-2).reverse().map((turn) => renderTurn(turn, true)).join("");
+  const all = (entry.thread || []).map((turn) => renderTurn(turn)).join("");
+  return `<section class="review-thread-recall"><div class="review-thread-recall-head"><span>${icon("messages-square")}追问记忆</span><small>帮助回想你的理解</small></div><div class="review-thread-recent">${recent}</div>${entry.thread.length > 2 ? `<details class="review-thread-all"><summary>展开全部 ${entry.thread.length} 轮</summary><div>${all}</div></details>` : ""}</section>`;
+}
+
 function renderReview() {
   const entries = dueEntries();
   const entry = entries[0];
@@ -883,10 +892,10 @@ function renderReview() {
     <article class="review-card ${state.reviewReveal ? "revealed" : ""}">
       <div class="review-prompt"><span>${entry.source ? escapeHtml(entry.source) : "语言片段"}</span><h2>${escapeHtml(entry.displayText || entry.raw)}</h2>${entry.pronunciation ? `<p>${escapeHtml(entry.pronunciation)}</p>` : ""}</div>
       <div class="review-answer" aria-hidden="${state.reviewReveal ? "false" : "true"}">
-        <span>你的理解</span><h3>${escapeHtml(entry.meaning)}</h3><p>${escapeHtml(entry.context)}</p>${words}${chunks}
+        <span>你的理解</span><h3>${escapeHtml(entry.meaning)}</h3><p>${escapeHtml(entry.context)}</p>${words}${chunks}${state.reviewReveal ? renderReviewThreadRecall(entry) : ""}
       </div>
       ${state.reviewReveal
-        ? `<div class="review-grades">${grades.map(([grade, label, gradeIcon]) => `<button type="button" data-action="grade-review" data-id="${entry.id}" data-grade="${grade}">${icon(gradeIcon)}<strong>${label}</strong><small>${formatInterval(previewInterval(entry, grade))}</small></button>`).join("")}</div>`
+        ? `<div class="review-followup-action"><button type="button" class="secondary-button" data-action="continue-review-thread" data-id="${escapeHtml(entry.id)}">${icon("message-circle-more")}再问一句</button></div><div class="review-grades">${grades.map(([grade, label, gradeIcon]) => `<button type="button" data-action="grade-review" data-id="${escapeHtml(entry.id)}" data-grade="${grade}">${icon(gradeIcon)}<strong>${label}</strong><small>${formatInterval(previewInterval(entry, grade))}</small></button>`).join("")}</div>`
         : `<div class="review-hint-controls"><button class="${state.reviewHint === "weak" ? "active" : ""}" type="button" data-action="review-hint" data-hint="weak">${icon("lightbulb")}弱提示</button><button class="${state.reviewHint === "strong" ? "active" : ""}" type="button" data-action="review-hint" data-hint="strong">${icon("sparkles")}强提示</button></div>${renderReviewHint(entry)}<button class="reveal-button" type="button" data-action="reveal-review">${icon("eye")}显示答案</button>`}
     </article>
   </div>`;
@@ -1538,6 +1547,21 @@ async function handleAction(action, id, grade, turnId, hint) {
     return renderTimeline();
   }
   if (action === "reveal-review") { state.reviewReveal = true; return renderTimeline(); }
+  if (action === "continue-review-thread" && entry) {
+    state.view = "threads";
+    state.selectedThreadEntryId = entry.id;
+    state.threadAnchorId = entry.id;
+    state.selectedEntryId = null;
+    state.reviewReveal = false;
+    state.reviewHint = "";
+    state.reviewFocusId = null;
+    state.reviewSessionTotal = 0;
+    state.detailClosed = false;
+    state.detailOpened = true;
+    render();
+    elements.threadInput.focus();
+    return;
+  }
   if (action === "start-review" && entry) {
     state.view = "review";
     elements.timeline.scrollTop = 0;
