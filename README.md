@@ -17,6 +17,30 @@
 
 ---
 
+## v0.5.0：从记录到理解的完整工作台
+
+这是拾词目前最完整的一次版本：它把碎片化记录、AI 解释、连续追问、遗忘曲线复习和本地数据管理放进同一套工作流。你可以只记录一个单词，也可以记录短语、句子或一段上下文；每条内容都独立保存，不会被其他历史对话污染。
+
+本版本重点包括：
+
+- **追问工作台**：围绕词条连续追问，支持 `@` 选择词条、保留问答记录、回退早期轮次，并可并行停止请求。
+- **更可靠的复习**：单词详情、语境、AI 理解和追问结论都能在复习中使用，四档反馈会调整下一次复习间隔。
+- **任意模型 Provider**：可保存多个 Responses API / Chat Completions Provider，从 `/v1/models` 获取模型，也可直接填写模型 ID。
+- **批量导入与 WebDAV**：历史 LLM 对话可按结构化 JSON 追加进现有词库；配置 WebDAV 后可增量合并词库与复习状态。
+- **本地优先**：词库、复习进度、追问记录和 Provider 配置默认保存在本机，更新应用不会覆盖已有数据。
+
+### 界面预览
+
+下面的截图来自实际界面，分别展示词库总览、长句详情和专注复习。点击词库中的条目可以打开完整详情，长句不会被列表截断；复习页则只保留当前卡片与四档反馈，适合连续操作。
+
+| 词库总览 | 长句与 AI 详情 | 专注复习 |
+| :--: | :--: | :--: |
+| <img src="docs/screenshots/library-light.png" width="300" alt="拾词词库总览界面"> | <img src="docs/screenshots/detail.png" width="300" alt="拾词长句详情界面"> | <img src="docs/screenshots/review.png" width="300" alt="拾词专注复习界面"> |
+
+macOS Apple Silicon 安装包：[`shici-0.5.0-macos-arm64.dmg`](https://github.com/MarchPhantasia/shici/releases/latest)。
+
+---
+
 ## 为什么做这个
 
 读一本书、看一集剧、刷一条推，卡住你的往往不是"一个生词"，而是一个短语、半句话、一种语气。
@@ -104,6 +128,8 @@ AI 会先判断片段类型，再给出**贴合当前语境**的中文理解，�
 ### 下载安装包
 
 前往 [Releases](https://github.com/MarchPhantasia/shici/releases) 下载对应平台的安装包。
+
+当前稳定发布为 **v0.5.0**，提供 macOS Apple Silicon `.dmg` 安装包。
 
 > 当前发布 macOS `.app` / `.dmg`。其余平台请见下方「跨平台构建」。
 

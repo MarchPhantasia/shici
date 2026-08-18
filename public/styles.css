@@ -1594,9 +1594,157 @@ select option:checked { background-color: var(--pink-soft); color: var(--text); 
 .workspace.detail-visible .library-column { width: auto; }
 
 @media (min-width: 761px) {
-  body.review-mode .workspace-body { display: block; width: min(100%, 1120px); padding-inline: 0; }
-  body.review-mode .library-column { width: 100%; }
-  body.review-mode .review-shell { width: min(100%, 860px); margin-inline: auto; }
+  body.review-mode .workspace-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    width: min(100%, 1120px);
+    padding-inline: 0;
+  }
+  body.review-mode .workspace:not(.detail-visible) .library-column {
+    width: 100%;
+    min-width: 0;
+    justify-self: stretch;
+  }
+  body.review-mode .timeline { display: grid; justify-items: center; align-content: start; }
+  body.review-mode .review-shell { width: min(100%, 820px); margin-inline: auto; }
   body.review-mode .review-card { width: 100%; margin-inline: auto; }
   .thread-studio-hero h2 { font-size: clamp(28px, 3.2vw, 42px); }
+}
+
+/* Keep the split workspace bounded when a long anchor is selected. */
+.workspace-body,
+.workspace-body > *,
+.library-column,
+.thread-composer,
+.thread-composer form,
+.thread-composer-main,
+.detail-panel {
+  min-width: 0;
+  max-width: 100%;
+}
+.workspace.detail-visible .workspace-body {
+  grid-template-columns: minmax(0, .78fr) minmax(0, 1.22fr);
+}
+.thread-composer,
+.thread-composer form,
+.thread-composer-main { width: 100%; }
+.thread-anchor {
+  flex: 0 1 42%;
+  max-width: 42%;
+}
+.thread-anchor-pill { max-width: 100%; }
+.thread-composer-main { overflow: hidden; }
+
+/* The detail rail should sit beside, never underneath, the capture column. */
+.workspace.detail-visible .detail-panel { position: relative; z-index: 2; }
+
+/* Narrow left columns use compact controls instead of wrapping their labels. */
+.workspace.detail-visible .library-head { gap: 8px; }
+.workspace.detail-visible .library-head > div:first-child { min-width: 0; }
+.workspace.detail-visible .library-head h1 { font-size: 20px; }
+.workspace.detail-visible .library-head p {
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace.detail-visible .library-controls { flex: 0 0 auto; gap: 5px; }
+.workspace.detail-visible .library-filter > span:first-child {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.workspace.detail-visible .library-filter > .custom-select {
+  width: 68px;
+  min-width: 0;
+  flex: 0 0 68px;
+}
+.workspace.detail-visible .library-filter > .custom-select .custom-select-trigger {
+  width: 68px;
+  max-width: 68px;
+  padding-inline: 8px 22px;
+}
+.workspace.detail-visible .library-filter:last-child > .custom-select,
+.workspace.detail-visible .library-filter:last-child > .custom-select .custom-select-trigger {
+  width: 88px;
+  max-width: 88px;
+}
+.workspace.detail-visible .library-filter:last-child > .custom-select { flex-basis: 88px; }
+
+/* Keep the follow-up action attached to the answer, not floating at the footer. */
+.review-card.revealed .review-answer { padding-bottom: 12px; }
+.review-followup-action { padding: 0 28px 10px; }
+
+/* A narrow detail split cannot support two capture cards side by side. */
+@media (min-width: 761px) {
+  .workspace.detail-visible .capture-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .workspace.detail-visible .capture-grid .composer,
+  .workspace.detail-visible .capture-grid .focus-card { width: 100%; }
+  .workspace.detail-visible .capture-grid .focus-card {
+    min-height: 96px;
+    padding-block: 12px;
+  }
+
+  /* The thread action is an icon-only control and must stay circular. */
+  .thread-composer-actions .send-button,
+  .thread-composer-actions .send-button:not(.stop) {
+    width: 32px;
+    min-width: 32px;
+    max-width: 32px;
+    height: 32px;
+    flex: 0 0 32px;
+    padding: 0;
+    border-radius: 50%;
+  }
+  .thread-composer-actions .send-button svg { margin: 0; }
+}
+
+/* Keep matched @ mentions readable without changing the textarea value. */
+.thread-input-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 48px;
+}
+.thread-input-highlight {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  padding: 3px 0;
+  overflow: hidden;
+  color: var(--text);
+  font: inherit;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  pointer-events: none;
+  scrollbar-width: none;
+}
+.thread-input-highlight mark {
+  border-radius: 5px;
+  background: var(--pink-soft);
+  color: var(--pink);
+}
+.thread-input-wrap textarea {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  min-width: 0;
+  flex: none;
+  background: transparent;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: var(--text);
+  scrollbar-gutter: stable;
+}
+.thread-input-wrap textarea::placeholder {
+  color: var(--faint);
+  -webkit-text-fill-color: var(--faint);
 }

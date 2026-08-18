@@ -102,6 +102,7 @@ const state = {
   newEntryIds: [],
   selectedThreadEntryId: null,
   threadAnchorId: null,
+  mentionRange: null,
   selectedEntryId: null,
   detailClosed: true,
   detailOpened: false,
@@ -151,6 +152,7 @@ const elements = {
   threadComposer: document.querySelector("#thread-composer"),
   threadForm: document.querySelector("#thread-form"),
   threadAnchor: document.querySelector("#thread-anchor"),
+  threadInputHighlight: document.querySelector("#thread-input-highlight"),
   threadInput: document.querySelector("#thread-input"),
   threadSend: document.querySelector("#thread-send"),
   threadAiState: document.querySelector("#thread-ai-state"),
@@ -608,28 +610,118 @@ function renderMentionOptions() {
   if (entries.length > visible.length) elements.mentionList.insertAdjacentHTML("beforeend", `<div class="mention-limit">继续输入以缩小范围</div>`);
 }
 
-function openMentionPopover() {
+function openMentionPopover({ focusSearch = true } = {}) {
+  const range = mentionTriggerRange();
+  if (range) {
+    state.mentionRange = range;
+  } else {
+    const caret = elements.threadInput.selectionStart ?? elements.threadInput.value.length;
+    state.mentionRange = { start: caret, end: elements.threadInput.selectionEnd ?? caret };
+  }
   elements.mentionPopover.hidden = false;
   elements.mentionSearch.value = "";
   renderMentionOptions();
-  elements.mentionSearch.focus();
+  if (focusSearch) elements.mentionSearch.focus();
 }
 
 function closeMentionPopover() {
   elements.mentionPopover.hidden = true;
   elements.mentionSearch.value = "";
+  state.mentionRange = null;
 }
 
-function isMentionOnly(value) {
-  return /[@＠]/.test(value) && value.replace(/[@＠]/g, "").trim() === "";
+function entryMentionLabel(entry) {
+  return (entry.displayText || entry.raw || "").trim();
+}
+
+function isMentionBoundary(character) {
+  return !character || !/[A-Za-z0-9_'-]/.test(character);
+}
+
+function threadMentionMatches(value) {
+  const matches = [];
+  for (let index = 0; index < value.length; index += 1) {
+    if (!"@＠".includes(value[index])) continue;
+    if (index > 0 && /[A-Za-z0-9_]/.test(value[index - 1])) continue;
+    const rest = value.slice(index + 1);
+    const candidate = state.entries
+      .map((entry) => ({ entry, label: entryMentionLabel(entry) }))
+      .filter(({ label }) => label && rest.slice(0, label.length).toLocaleLowerCase() === label.toLocaleLowerCase() && isMentionBoundary(rest[label.length]))
+      .sort((left, right) => right.label.length - left.label.length)[0];
+    if (!candidate) continue;
+    matches.push({ entry: candidate.entry, start: index, end: index + 1 + candidate.label.length });
+    index = index + candidate.label.length;
+  }
+  return matches;
+}
+
+function mentionTriggerRange() {
+  const value = elements.threadInput.value;
+  const caret = elements.threadInput.selectionStart ?? value.length;
+  const prefix = value.slice(0, caret);
+  const at = Math.max(prefix.lastIndexOf("@"), prefix.lastIndexOf("＠"));
+  if (at < 0 || prefix.slice(at).includes("\n")) return null;
+  if (at > 0 && /[A-Za-z0-9_]/.test(prefix[at - 1])) return null;
+  return { start: at, end: caret };
+}
+
+function renderThreadInputHighlight(value, matches = threadMentionMatches(value)) {
+  let cursor = 0;
+  let html = "";
+  for (const match of matches) {
+    html += escapeHtml(value.slice(cursor, match.start));
+    html += `<mark>${escapeHtml(value.slice(match.start, match.end))}</mark>`;
+    cursor = match.end;
+  }
+  elements.threadInputHighlight.innerHTML = `${html}${escapeHtml(value.slice(cursor))}`;
+  elements.threadInputHighlight.scrollTop = elements.threadInput.scrollTop;
+  elements.threadInputHighlight.scrollLeft = elements.threadInput.scrollLeft;
+}
+
+function syncThreadMentionState() {
+  const matches = threadMentionMatches(elements.threadInput.value);
+  const previousId = state.threadAnchorId;
+  const hasPending = previousId && pendingForEntry(previousId).length > 0;
+  state.threadAnchorId = matches.at(-1)?.entry.id || (hasPending ? previousId : null);
+  renderThreadInputHighlight(elements.threadInput.value, matches);
+  return matches;
+}
+
+function resizeThreadInput() {
+  elements.threadInput.style.height = "auto";
+  elements.threadInput.style.height = `${Math.min(elements.threadInput.scrollHeight, 150)}px`;
+  renderThreadInputHighlight(elements.threadInput.value);
 }
 
 function openMentionFromInput() {
-  if (!isMentionOnly(elements.threadInput.value)) return false;
-  elements.threadInput.value = "";
-  elements.threadInput.style.height = "auto";
-  openMentionPopover();
+  const range = mentionTriggerRange();
+  if (!range || range.end - range.start !== 1) return false;
+  state.mentionRange = range;
+  openMentionPopover({ focusSearch: false });
   return true;
+}
+
+function insertThreadMention(entry) {
+  const value = elements.threadInput.value;
+  const range = state.mentionRange || { start: elements.threadInput.selectionStart ?? value.length, end: elements.threadInput.selectionEnd ?? value.length };
+  const label = `@${entryMentionLabel(entry)}`;
+  const suffix = value.slice(range.end);
+  const needsSpace = " ";
+  const nextValue = `${value.slice(0, range.start)}${label}${needsSpace}${suffix}`;
+  elements.threadInput.value = nextValue;
+  const caret = range.start + label.length + needsSpace.length;
+  elements.threadInput.setSelectionRange(caret, caret);
+  state.threadAnchorId = entry.id;
+  resizeThreadInput();
+}
+
+function removeThreadMention(entryId) {
+  const match = threadMentionMatches(elements.threadInput.value).find((item) => item.entry.id === entryId) || threadMentionMatches(elements.threadInput.value).at(-1);
+  if (!match) return;
+  const value = elements.threadInput.value;
+  elements.threadInput.value = `${value.slice(0, match.start)}${value.slice(match.end)}`.replace(/^\s+/, "");
+  elements.threadInput.setSelectionRange(match.start, match.start);
+  resizeThreadInput();
 }
 
 function renderThreadComposer() {
@@ -639,20 +731,21 @@ function renderThreadComposer() {
     closeMentionPopover();
     return;
   }
+  syncThreadMentionState();
   const entry = state.entries.find((item) => item.id === state.threadAnchorId);
   const pending = entry ? pendingForEntry(entry.id) : [];
-  elements.threadAnchor.innerHTML = entry
-    ? `<button class="thread-anchor-pill" type="button" data-action="open-mentions" aria-label="更换提问词条"><span>${icon("at-sign")}</span><strong>${escapeHtml(entry.displayText || entry.raw)}</strong>${icon("chevron-down")}</button><button class="thread-anchor-remove" type="button" data-action="clear-thread-anchor" aria-label="移除提问词条">${icon("x")}</button>`
-    : `<button class="thread-anchor-empty" type="button" data-action="open-mentions">${icon("at-sign")}选择词条</button>`;
+  elements.threadAnchor.innerHTML = "";
+  elements.threadAnchor.hidden = true;
   elements.threadSend.classList.toggle("stop", pending.length > 0);
-  elements.threadSend.disabled = !state.storageReady;
+  elements.threadSend.disabled = !state.storageReady || (!pending.length && !entry);
   elements.threadSend.innerHTML = `<span class="thread-send-icon">${pending.length ? icon("square") : icon("arrow-up")}</span>`;
   elements.threadSend.setAttribute("aria-label", pending.length ? "停止当前词条追问" : "发送追问");
   elements.threadSend.title = pending.length ? "停止当前词条追问" : `发送：${shortcutLabels[appearance.sendShortcut]}`;
   elements.threadAiState.className = `ai-state${pending.length ? " processing" : ""}`;
+  elements.threadAiState.hidden = !pending.length;
   elements.threadAiState.innerHTML = pending.length
     ? `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>${pending.length > 1 ? `${pending.length} 个请求` : "正在追问"}`
-    : `<span class="status-dot"></span>${entry ? "已选择词条" : "先选择词条"}`;
+    : "";
   refreshIcons();
 }
 
@@ -1335,6 +1428,7 @@ function restoreThreadDraft(pending, message) {
   const restore = () => {
     state.threadAnchorId = pending.entryId;
     elements.threadInput.value = pending.text;
+    resizeThreadInput();
     elements.threadInput.focus();
     renderThreadComposer();
   };
@@ -1348,6 +1442,7 @@ function restoreThreadDraft(pending, message) {
 
 async function submitThreadQuestion(event) {
   event.preventDefault();
+  syncThreadMentionState();
   const entry = state.entries.find((item) => item.id === state.threadAnchorId);
   const text = elements.threadInput.value.trim();
   if (!entry) {
@@ -1476,6 +1571,7 @@ async function handleAction(action, id, grade, turnId, hint) {
     return;
   }
   if (action === "clear-thread-anchor") {
+    removeThreadMention(state.threadAnchorId);
     state.threadAnchorId = null;
     closeMentionPopover();
     renderThreadComposer();
@@ -1483,7 +1579,7 @@ async function handleAction(action, id, grade, turnId, hint) {
     return;
   }
   if (action === "select-thread-anchor" && entry) {
-    state.threadAnchorId = entry.id;
+    insertThreadMention(entry);
     closeMentionPopover();
     renderThreadComposer();
     elements.threadInput.focus();
@@ -1509,7 +1605,7 @@ async function handleAction(action, id, grade, turnId, hint) {
     return;
   }
   if (action === "set-thread-anchor" && entry) {
-    state.threadAnchorId = entry.id;
+    insertThreadMention(entry);
     closeMentionPopover();
     renderThreadComposer();
     renderDetailPanel();
@@ -1569,6 +1665,7 @@ async function handleAction(action, id, grade, turnId, hint) {
   if (action === "continue-review-thread" && entry) {
     state.view = "threads";
     state.selectedThreadEntryId = entry.id;
+    elements.threadInput.value = `@${entryMentionLabel(entry)} `;
     state.threadAnchorId = entry.id;
     state.selectedEntryId = null;
     state.reviewReveal = false;
@@ -1577,6 +1674,7 @@ async function handleAction(action, id, grade, turnId, hint) {
     state.reviewSessionTotal = 0;
     state.detailClosed = false;
     state.detailOpened = true;
+    resizeThreadInput();
     render();
     elements.threadInput.focus();
     return;
@@ -1604,10 +1702,12 @@ async function handleAction(action, id, grade, turnId, hint) {
   if (action === "continue" && entry) {
     state.view = "threads";
     state.selectedThreadEntryId = entry.id;
+    elements.threadInput.value = `@${entryMentionLabel(entry)} `;
     state.threadAnchorId = entry.id;
     state.selectedEntryId = null;
     state.detailClosed = false;
     state.detailOpened = true;
+    resizeThreadInput();
     render(); elements.threadInput.focus(); return;
   }
   if ((action === "toggle-thread" || action === "toggle-details") && entry) {
@@ -1771,10 +1871,19 @@ elements.threadSend.addEventListener("click", (event) => {
   stopThreadRequest(entry.id);
 });
 elements.threadInput.addEventListener("keydown", (event) => {
-  if ((event.key === "@" || event.key === "＠") && !event.isComposing && !elements.threadInput.value.trim()) {
-    event.preventDefault();
-    openMentionPopover();
-    return;
+  if (event.key === "Enter" && !event.isComposing && !elements.mentionPopover.hidden) {
+    const option = elements.mentionList.querySelector('.mention-option[aria-selected="true"]') || elements.mentionList.querySelector(".mention-option");
+    if (option) {
+      event.preventDefault();
+      option.click();
+      return;
+    }
+  }
+  if ((event.key === "@" || event.key === "＠") && !event.isComposing) {
+    requestAnimationFrame(() => {
+      syncThreadMentionState();
+      if (mentionTriggerRange()?.end - mentionTriggerRange()?.start === 1) openMentionFromInput();
+    });
   }
   if (event.key !== "Enter" || event.isComposing) return;
   const sends = appearance.sendShortcut === "mod-enter"
@@ -1785,12 +1894,23 @@ elements.threadInput.addEventListener("keydown", (event) => {
   if (sends) { event.preventDefault(); elements.threadForm.requestSubmit(); }
 });
 elements.threadInput.addEventListener("input", () => {
-  if (openMentionFromInput()) return;
-  elements.threadInput.style.height = "auto";
-  elements.threadInput.style.height = `${Math.min(elements.threadInput.scrollHeight, 150)}px`;
+  resizeThreadInput();
+  syncThreadMentionState();
   elements.threadMessage.textContent = "";
+  renderThreadComposer();
+  const openedMention = openMentionFromInput();
+  if (!openedMention && !elements.mentionPopover.hidden) closeMentionPopover();
 });
-elements.threadInput.addEventListener("compositionend", openMentionFromInput);
+elements.threadInput.addEventListener("scroll", () => {
+  elements.threadInputHighlight.scrollTop = elements.threadInput.scrollTop;
+  elements.threadInputHighlight.scrollLeft = elements.threadInput.scrollLeft;
+});
+elements.threadInput.addEventListener("compositionend", () => {
+  resizeThreadInput();
+  syncThreadMentionState();
+  renderThreadComposer();
+  openMentionFromInput();
+});
 elements.mentionSearch.addEventListener("input", renderMentionOptions);
 elements.mentionSearch.addEventListener("keydown", (event) => {
   const options = [...elements.mentionList.querySelectorAll(".mention-option")];

@@ -7,7 +7,7 @@
     <meta name="description" content="拾词：捕捉并理解散落在任何场景里的语言片段。" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=30" />
+    <link rel="stylesheet" href="/styles.css?v=34" />
     <title>拾词</title>
   </head>
   <body>
@@ -41,11 +41,14 @@
               <form id="thread-form">
                 <div class="thread-composer-main">
                   <div class="thread-anchor" id="thread-anchor"></div>
-                  <textarea id="thread-input" rows="2" maxlength="5000" placeholder="选择一个词条，继续追问…"></textarea>
+                  <div class="thread-input-wrap">
+                    <div class="thread-input-highlight" id="thread-input-highlight" aria-hidden="true"></div>
+                    <textarea id="thread-input" rows="2" maxlength="5000" placeholder="输入 @ 选择词条，再写下问题…"></textarea>
+                  </div>
                 </div>
                 <div class="thread-composer-row">
                   <span class="thread-composer-message" id="thread-composer-message" role="status" aria-live="polite"></span>
-                  <div class="thread-composer-actions"><span class="ai-state" id="thread-ai-state"><span class="status-dot"></span>就绪</span><button class="send-button" id="thread-send" type="submit" aria-label="发送追问"></button></div>
+                  <div class="thread-composer-actions"><span class="ai-state" id="thread-ai-state" hidden></span><button class="send-button" id="thread-send" type="submit" aria-label="发送追问"></button></div>
                 </div>
               </form>
               <div class="mention-popover" id="mention-popover" hidden>
@@ -317,6 +320,6 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script src="/vendor/lucide.min.js?v=19"></script>
-    <script type="module" src="/app.js?v=32"></script>
+    <script type="module" src="/app.js?v=34"></script>
   </body>
 </html>
