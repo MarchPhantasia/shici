@@ -620,6 +620,18 @@ function closeMentionPopover() {
   elements.mentionSearch.value = "";
 }
 
+function isMentionOnly(value) {
+  return /[@＠]/.test(value) && value.replace(/[@＠]/g, "").trim() === "";
+}
+
+function openMentionFromInput() {
+  if (!isMentionOnly(elements.threadInput.value)) return false;
+  elements.threadInput.value = "";
+  elements.threadInput.style.height = "auto";
+  openMentionPopover();
+  return true;
+}
+
 function renderThreadComposer() {
   const visible = state.view === "threads";
   elements.threadComposer.hidden = !visible;
@@ -634,13 +646,14 @@ function renderThreadComposer() {
     : `<button class="thread-anchor-empty" type="button" data-action="open-mentions">${icon("at-sign")}选择词条</button>`;
   elements.threadSend.classList.toggle("stop", pending.length > 0);
   elements.threadSend.disabled = !state.storageReady;
-  elements.threadSend.innerHTML = pending.length ? icon("square") : icon("arrow-up");
+  elements.threadSend.innerHTML = `<span class="thread-send-icon">${pending.length ? icon("square") : icon("arrow-up")}</span>`;
   elements.threadSend.setAttribute("aria-label", pending.length ? "停止当前词条追问" : "发送追问");
   elements.threadSend.title = pending.length ? "停止当前词条追问" : `发送：${shortcutLabels[appearance.sendShortcut]}`;
   elements.threadAiState.className = `ai-state${pending.length ? " processing" : ""}`;
   elements.threadAiState.innerHTML = pending.length
     ? `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>${pending.length > 1 ? `${pending.length} 个请求` : "正在追问"}`
     : `<span class="status-dot"></span>${entry ? "已选择词条" : "先选择词条"}`;
+  refreshIcons();
 }
 
 function renderThreadIndex() {
@@ -698,7 +711,7 @@ function renderThreadStudio(entry) {
   return `<article class="detail-sheet thread-studio">
     <div class="detail-toolbar"><span>理解笔记</span><div class="thread-studio-pending">${pending.length ? `<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>${pending.length > 1 ? `${pending.length} 个请求` : "追问中"}<button class="text-button" type="button" data-action="stop-thread-request" data-id="${escapeHtml(entry.id)}">停止</button>` : ""}<button class="icon-button" type="button" data-action="close-detail" aria-label="关闭详情">${icon("x")}</button></div></div>
     <div class="detail-scroll">
-      <header class="detail-hero thread-studio-hero"><h2>${escapeHtml(displayText)}</h2><div class="detail-badges"><span>${kindLabels[entry.kind] || "片段"}</span>${entry.pronunciation ? `<span>${escapeHtml(entry.pronunciation)}</span>` : ""}${entry.source ? `<span>${escapeHtml(entry.source)}</span>` : ""}</div>${entry.correction ? `<p class="detail-correction">已纠正：${escapeHtml(entry.correction)}</p>` : ""}<p class="thread-studio-meaning">${escapeHtml(entry.meaning)}</p><div class="thread-studio-links"><button class="text-button" type="button" data-action="set-thread-anchor" data-id="${escapeHtml(entry.id)}">设为提问对象</button><button class="text-button" type="button" data-action="open-library-entry" data-id="${escapeHtml(entry.id)}">打开词库详情</button></div></header>
+      <header class="detail-hero thread-studio-hero"><h2>${escapeHtml(displayText)}</h2><div class="detail-badges"><span>${kindLabels[entry.kind] || "片段"}</span>${entry.pronunciation ? `<span>${escapeHtml(entry.pronunciation)}</span>` : ""}${entry.source ? `<span>${escapeHtml(entry.source)}</span>` : ""}</div>${entry.correction ? `<p class="detail-correction">已纠正：${escapeHtml(entry.correction)}</p>` : ""}<p class="thread-studio-meaning">${escapeHtml(entry.meaning)}</p><div class="thread-studio-links"><button class="thread-tool ${state.threadAnchorId === entry.id ? "selected" : ""}" type="button" data-action="set-thread-anchor" data-id="${escapeHtml(entry.id)}">${icon(state.threadAnchorId === entry.id ? "check" : "at-sign")}${state.threadAnchorId === entry.id ? "当前提问对象" : "设为提问对象"}</button><button class="thread-tool" type="button" data-action="open-library-entry" data-id="${escapeHtml(entry.id)}">${icon("book-open")}打开词库详情</button></div></header>
       <main class="detail-body">${turns.length ? `<section class="thread-notes">${notes}</section>` : `<div class="thread-studio-empty">${icon("message-circle-more")}<p>这个词条已回到原片段，还没有追问记录。</p><button class="secondary-button" type="button" data-action="close-detail">关闭笔记</button></div>`}<details class="thread-entry-details"><summary>查看完整词条</summary><div>${renderEntrySupportingSections(entry, false)}</div></details></main>
     </div>
     <footer class="detail-actions"><span class="thread-studio-status">${review.leech ? "顽固词" : isDue(entry) ? "今天待复习" : `下次 ${dueLabel(entry)}`}</span>${isDue(entry) ? `<button class="secondary-button" type="button" data-action="start-review" data-id="${escapeHtml(entry.id)}">${icon("brain")}复习</button>` : ""}<button class="primary-button" type="button" data-action="continue" data-id="${escapeHtml(entry.id)}">${icon("message-circle-more")}再问一句</button></footer>
@@ -839,24 +852,27 @@ function renderEntry(entry) {
 
 function renderReviewHint(entry) {
   if (!state.reviewHint) return "";
-  if (state.reviewHint === "weak") {
-    const usage = (entry.usage || []).filter(Boolean).slice(0, 2);
-    const chunks = (entry.chunks || []).filter((chunk) => chunk?.text || chunk?.meaning).slice(0, 3);
-    const content = usage.length
-      ? `<div class="review-hint-copy">${usage.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div>`
-      : chunks.length
-        ? `<div class="review-hint-chunks">${chunks.map((chunk) => `<span><strong>${escapeHtml(chunk.text)}</strong>${escapeHtml(chunk.meaning)}</span>`).join("")}</div>`
-        : `<p>这个片段暂时没有可用的例句提示。</p>`;
-    return `<aside class="review-hint-panel weak"><span>${icon("lightbulb")}弱提示</span>${content}</aside>`;
-  }
+  const usage = (entry.usage || []).filter(Boolean).slice(0, 2);
+  const chunks = (entry.chunks || []).filter((chunk) => chunk?.text || chunk?.meaning).slice(0, 3);
+  const weakContent = usage.length
+    ? `<div class="review-hint-copy">${usage.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div>`
+    : chunks.length
+      ? `<div class="review-hint-chunks">${chunks.map((chunk) => `<span><strong>${escapeHtml(chunk.text)}</strong>${escapeHtml(chunk.meaning)}</span>`).join("")}</div>`
+      : `<p>这个片段暂时没有可用的语境线索。</p>`;
+  const weakPanel = `<aside class="review-hint-panel weak"><span>${icon("lightbulb")}语境线索</span>${weakContent}</aside>`;
+  if (state.reviewHint === "weak") return weakPanel;
   const details = [...new Set([entry.context, entry.conclusion].filter(Boolean))];
-  return `<aside class="review-hint-panel strong"><span>${icon("sparkles")}AI 理解</span>${details.length ? details.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : `<p>${escapeHtml(entry.meaning || "暂无更多理解提示。")}</p>`}</aside>`;
+  return `${weakPanel}<aside class="review-hint-panel strong"><span>${icon("sparkles")}理解要点</span>${details.length ? details.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : `<p>${escapeHtml(entry.meaning || "暂无更多理解提示。")}</p>`}</aside>`;
+}
+
+function renderReviewDetails(entry) {
+  return `<div class="review-detail-stack">${renderEntrySupportingSections(entry, false)}</div>`;
 }
 
 function renderReviewThreadRecall(entry) {
-  const turns = (entry.thread || []).filter((turn) => turn?.summary);
+  const turns = (entry.thread || []).filter((turn) => turn?.question || turn?.answer || turn?.summary);
   if (!turns.length) return "";
-  const renderTurn = (turn, compact = false) => `<article class="review-thread-turn${compact ? " compact" : ""}"><strong>${escapeHtml(turn.summary)}</strong><p>${escapeHtml(turn.question)}</p>${compact ? "" : `<div><span>答</span>${escapeHtml(turn.answer)}</div>`}</article>`;
+  const renderTurn = (turn, compact = false) => `<article class="review-thread-turn${compact ? " compact" : ""}"><strong>${escapeHtml(turn.summary || turn.answer || "这轮追问没有留下结论")}</strong><p>${escapeHtml(turn.question || "")}</p>${compact ? "" : `<div><span>答</span>${escapeHtml(turn.answer || "")}</div>`}</article>`;
   const recent = turns.slice(-2).reverse().map((turn) => renderTurn(turn, true)).join("");
   const all = (entry.thread || []).map((turn) => renderTurn(turn)).join("");
   return `<section class="review-thread-recall"><div class="review-thread-recall-head"><span>${icon("messages-square")}追问记忆</span><small>帮助回想你的理解</small></div><div class="review-thread-recent">${recent}</div>${entry.thread.length > 2 ? `<details class="review-thread-all"><summary>展开全部 ${entry.thread.length} 轮</summary><div>${all}</div></details>` : ""}</section>`;
@@ -875,8 +891,6 @@ function renderReview() {
   if (!state.reviewSessionTotal) state.reviewSessionTotal = entries.length;
   const completed = Math.max(0, state.reviewSessionTotal - entries.length);
   const progress = Math.round((completed / state.reviewSessionTotal) * 100);
-  const chunks = entry.chunks?.length ? `<div class="review-chunks">${entry.chunks.map((chunk) => `<span><strong>${escapeHtml(chunk.text)}</strong>${escapeHtml(chunk.meaning)}</span>`).join("")}</div>` : "";
-  const words = entry.words?.length ? renderWords(entry, "review-words") : "";
   const grades = [
     ["again", "忘记", "rotate-ccw"],
     ["hard", "困难", "chevrons-right"],
@@ -892,11 +906,11 @@ function renderReview() {
     <article class="review-card ${state.reviewReveal ? "revealed" : ""}">
       <div class="review-prompt"><span>${entry.source ? escapeHtml(entry.source) : "语言片段"}</span><h2>${escapeHtml(entry.displayText || entry.raw)}</h2>${entry.pronunciation ? `<p>${escapeHtml(entry.pronunciation)}</p>` : ""}</div>
       <div class="review-answer" aria-hidden="${state.reviewReveal ? "false" : "true"}">
-        <span>你的理解</span><h3>${escapeHtml(entry.meaning)}</h3><p>${escapeHtml(entry.context)}</p>${words}${chunks}${state.reviewReveal ? renderReviewThreadRecall(entry) : ""}
+        <span>你的理解</span><h3>${escapeHtml(entry.meaning)}</h3><p>${escapeHtml(entry.context)}</p>${state.reviewReveal ? `${renderReviewDetails(entry)}${renderReviewThreadRecall(entry)}` : ""}
       </div>
       ${state.reviewReveal
         ? `<div class="review-followup-action"><button type="button" class="secondary-button" data-action="continue-review-thread" data-id="${escapeHtml(entry.id)}">${icon("message-circle-more")}再问一句</button></div><div class="review-grades">${grades.map(([grade, label, gradeIcon]) => `<button type="button" data-action="grade-review" data-id="${escapeHtml(entry.id)}" data-grade="${grade}">${icon(gradeIcon)}<strong>${label}</strong><small>${formatInterval(previewInterval(entry, grade))}</small></button>`).join("")}</div>`
-        : `<div class="review-hint-controls"><button class="${state.reviewHint === "weak" ? "active" : ""}" type="button" data-action="review-hint" data-hint="weak">${icon("lightbulb")}弱提示</button><button class="${state.reviewHint === "strong" ? "active" : ""}" type="button" data-action="review-hint" data-hint="strong">${icon("sparkles")}强提示</button></div>${renderReviewHint(entry)}<button class="reveal-button" type="button" data-action="reveal-review">${icon("eye")}显示答案</button>`}
+        : `<div class="review-hint-controls">${state.reviewHint === "" ? `<button type="button" data-action="review-hint" data-hint="weak">${icon("lightbulb")}给我一点线索</button>` : state.reviewHint === "weak" ? `<button type="button" data-action="review-hint" data-hint="strong">${icon("sparkles")}再多解释一点</button>` : ""}</div>${renderReviewHint(entry)}<button class="reveal-button" type="button" data-action="reveal-review">${icon("eye")}显示答案</button>`}
     </article>
   </div>`;
 }
@@ -1496,6 +1510,11 @@ async function handleAction(action, id, grade, turnId, hint) {
   }
   if (action === "set-thread-anchor" && entry) {
     state.threadAnchorId = entry.id;
+    closeMentionPopover();
+    renderThreadComposer();
+    renderDetailPanel();
+    refreshIcons();
+    elements.threadInput.focus();
     toast(`已选择“${entry.displayText || entry.raw}”作为提问对象`);
     return;
   }
@@ -1752,7 +1771,7 @@ elements.threadSend.addEventListener("click", (event) => {
   stopThreadRequest(entry.id);
 });
 elements.threadInput.addEventListener("keydown", (event) => {
-  if (event.key === "@" && !elements.threadInput.value.trim()) {
+  if ((event.key === "@" || event.key === "＠") && !event.isComposing && !elements.threadInput.value.trim()) {
     event.preventDefault();
     openMentionPopover();
     return;
@@ -1766,10 +1785,12 @@ elements.threadInput.addEventListener("keydown", (event) => {
   if (sends) { event.preventDefault(); elements.threadForm.requestSubmit(); }
 });
 elements.threadInput.addEventListener("input", () => {
+  if (openMentionFromInput()) return;
   elements.threadInput.style.height = "auto";
   elements.threadInput.style.height = `${Math.min(elements.threadInput.scrollHeight, 150)}px`;
   elements.threadMessage.textContent = "";
 });
+elements.threadInput.addEventListener("compositionend", openMentionFromInput);
 elements.mentionSearch.addEventListener("input", renderMentionOptions);
 elements.mentionSearch.addEventListener("keydown", (event) => {
   const options = [...elements.mentionList.querySelectorAll(".mention-option")];
