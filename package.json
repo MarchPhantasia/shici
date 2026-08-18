@@ -1,6 +1,6 @@
 {
   "name": "shici",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "description": "拾词 — 面向碎片化语言输入的本地优先学习工具：随手捕捉任意语言片段，由任意 OpenAI 兼容模型解释，并按自适应节奏复习。",
   "license": "AGPL-3.0-only",
